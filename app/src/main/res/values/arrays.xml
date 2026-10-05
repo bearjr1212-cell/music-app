@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string-array name="format_modes">
+        <item>Best single-file</item>
+        <item>Up to 1080p</item>
+        <item>Up to 720p</item>
+        <item>Up to 480p</item>
+        <item>Audio only (source format)</item>
+        <item>Audio only (MP3)</item>
+    </string-array>
+</resources>
