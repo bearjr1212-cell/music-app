@@ -124,27 +124,35 @@ class PlaylistStore(context: Context) : SQLiteOpenHelper(
 
     @Synchronized
     fun getPlaylists(): List<SavedPlaylist> {
-        val database = readableDatabase
-        val playlists = mutableListOf<SavedPlaylist>()
-        database.query("playlists", arrayOf("id", "name"), null, null, null, null, "id ASC").use { cursor ->
+        // Single JOIN query instead of N+1 separate queries.
+        val playlistOrder = linkedMapOf<Long, String>()   // id → name
+        val trackMap = linkedMapOf<Long, MutableList<String>>() // id → [uri, …]
+
+        readableDatabase.rawQuery(
+            """
+            SELECT p.id, p.name, pt.track_uri
+            FROM playlists p
+            LEFT JOIN playlist_tracks pt ON p.id = pt.playlist_id
+            ORDER BY p.id ASC, pt.position ASC, pt.added_at ASC, pt.track_uri ASC
+            """.trimIndent(),
+            null,
+        ).use { cursor ->
             while (cursor.moveToNext()) {
                 val id = cursor.getLong(0)
-                val tracks = mutableListOf<String>()
-                database.query(
-                    "playlist_tracks",
-                    arrayOf("track_uri"),
-                    "playlist_id = ?",
-                    arrayOf(id.toString()),
-                    null,
-                    null,
-                    "position ASC, added_at ASC, track_uri ASC",
-                ).use { trackCursor ->
-                    while (trackCursor.moveToNext()) tracks.add(trackCursor.getString(0))
+                val name = cursor.getString(1)
+                if (!playlistOrder.containsKey(id)) {
+                    playlistOrder[id] = name
+                    trackMap[id] = mutableListOf()
                 }
-                playlists.add(SavedPlaylist(id, cursor.getString(1), tracks))
+                if (!cursor.isNull(2)) {
+                    trackMap[id]!!.add(cursor.getString(2))
+                }
             }
         }
-        return playlists
+
+        return playlistOrder.map { (id, name) ->
+            SavedPlaylist(id, name, trackMap[id] ?: emptyList())
+        }
     }
 
     @Synchronized

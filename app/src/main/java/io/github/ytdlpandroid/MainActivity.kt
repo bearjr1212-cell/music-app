@@ -48,16 +48,7 @@ import java.io.FileOutputStream
 import java.security.MessageDigest
 import java.util.concurrent.Executors
 
-data class AudioTrack(
-    val uri: Uri,
-    val title: String,
-    val artist: String,
-    val album: String,
-    val durationMs: Long,
-    val artwork: Bitmap?,
-    val dateAdded: Long = 0L,
-    val thumbnailUrl: String? = null,
-)
+// AudioTrack is defined in AudioTrack.kt (shared with TrackRepository)
 
 data class PlaylistImportItem(
     val uri: String,
@@ -671,11 +662,18 @@ class MainActivity : Activity(), DownloadService.Listener {
     }
 
     private fun renderSearchDownloadIndicators(jobs: List<DownloadJob>) {
-        searchDownloadIndicators.forEach { (url, indicator) ->
-            val job = jobs.firstOrNull { candidate ->
-                val jobUrls = org.json.JSONArray(candidate.urlsJson)
-                (0 until jobUrls.length()).any { jobUrls.optString(it) == url }
+        // Build a url→job map once (O(n)) instead of scanning all jobs per indicator (O(n×m)).
+        val jobByUrl = mutableMapOf<String, DownloadJob>()
+        jobs.forEach { job ->
+            val jobUrls = org.json.JSONArray(job.urlsJson)
+            for (i in 0 until jobUrls.length()) {
+                val url = jobUrls.optString(i)
+                if (url.isNotEmpty()) jobByUrl[url] = job
             }
+        }
+
+        searchDownloadIndicators.forEach { (url, indicator) ->
+            val job = jobByUrl[url]
             val active = job?.state == DownloadQueueStore.STATE_QUEUED ||
                 job?.state == DownloadQueueStore.STATE_RUNNING
             indicator.spinner.visibility = if (active) View.VISIBLE else View.GONE

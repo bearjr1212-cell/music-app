@@ -7,6 +7,7 @@ import io.github.ytdlpandroid.PlaybackHistoryEntry
 import io.github.ytdlpandroid.SavedPlaylist
 import io.github.ytdlpandroid.SavedTrackMetadata
 import io.github.ytdlpandroid.repository.PlaylistRepository
+import io.github.ytdlpandroid.AppConfig
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -43,7 +44,6 @@ class PlaylistViewModel @Inject constructor(
     val hasMoreHistory: StateFlow<Boolean> = _hasMoreHistory.asStateFlow()
     
     private var historyBeforeId: Long? = null
-    private const val HISTORY_PAGE_SIZE = 50
     
     /**
      * Loads all playlists from the database.
@@ -215,14 +215,14 @@ class PlaylistViewModel @Inject constructor(
      */
     fun loadPlaybackHistory(loadMore: Boolean = false) {
         viewModelScope.launch {
-            if (loadMore && !_hasMoreHistory.value) return
+            if (loadMore && !_hasMoreHistory.value) return@launch
             
             _isLoadingHistory.value = true
             _error.value = null
             
             try {
                 val beforeId = if (loadMore) historyBeforeId else null
-                val entries = playlistRepository.getPlaybackHistory(HISTORY_PAGE_SIZE, beforeId)
+                val entries = playlistRepository.getPlaybackHistory(AppConfig.HISTORY_PAGE_SIZE, beforeId)
                 
                 if (loadMore) {
                     _playbackHistory.value = _playbackHistory.value + entries
@@ -230,7 +230,7 @@ class PlaylistViewModel @Inject constructor(
                     _playbackHistory.value = entries
                 }
                 
-                _hasMoreHistory.value = entries.size == HISTORY_PAGE_SIZE
+                _hasMoreHistory.value = entries.size == AppConfig.HISTORY_PAGE_SIZE
                 historyBeforeId = entries.lastOrNull()?.id
             } catch (e: Exception) {
                 _error.value = "Failed to load playback history: ${e.message}"

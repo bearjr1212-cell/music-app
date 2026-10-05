@@ -167,7 +167,7 @@ class DownloadViewModel @Inject constructor(
     fun clearFinished() {
         viewModelScope.launch {
             try {
-                val removed = downloadService.clearFinished()
+                val removed = downloadService?.clearFinished() ?: return@launch
                 if (removed > 0) {
                     loadJobs()
                 }
