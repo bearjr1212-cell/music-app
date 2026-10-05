@@ -1,13 +1,11 @@
 package io.github.ytdlpandroid.viewmodel
 
+import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
-import io.github.ytdlpandroid.PlaybackHistoryEntry
 import io.github.ytdlpandroid.SavedPlaylist
-import io.github.ytdlpandroid.SavedTrackMetadata
 import io.github.ytdlpandroid.repository.PlaylistRepository
-import io.github.ytdlpandroid.AppConfig
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -15,277 +13,271 @@ import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 /**
- * ViewModel for managing playlists and playback history.
- * Handles playlist CRUD operations and playback history management.
+ * ViewModel for managing playlists, liked songs, and per-playlist track operations.
+ * All data access is delegated to PlaylistRepository on Dispatchers.IO (via the repository).
  */
 @HiltViewModel
 class PlaylistViewModel @Inject constructor(
     private val playlistRepository: PlaylistRepository,
 ) : ViewModel() {
-    
-    // Playlist state
+
+    companion object {
+        /** Canonical name used to identify the Liked Songs playlist. */
+        const val LIKED_SONGS_NAME = "Liked Songs"
+    }
+
+    // --- Playlist list ---
+
     private val _playlists = MutableStateFlow<List<SavedPlaylist>>(emptyList())
     val playlists: StateFlow<List<SavedPlaylist>> = _playlists.asStateFlow()
-    
+
+    // --- Liked Songs (derived: first playlist named "Liked Songs", case-insensitive) ---
+
+    private val _likedPlaylist = MutableStateFlow<SavedPlaylist?>(null)
+    val likedPlaylist: StateFlow<SavedPlaylist?> = _likedPlaylist.asStateFlow()
+
+    // --- Selected playlist (for the detail view) ---
+
+    private val _selectedPlaylist = MutableStateFlow<SavedPlaylist?>(null)
+    val selectedPlaylist: StateFlow<SavedPlaylist?> = _selectedPlaylist.asStateFlow()
+
+    // --- Loading / error state ---
+
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
-    
-    private val _error = MutableStateFlow<String?>(null)
-    val error: StateFlow<String?> = _error.asStateFlow()
-    
-    // Playback history state
-    private val _playbackHistory = MutableStateFlow<List<PlaybackHistoryEntry>>(emptyList())
-    val playbackHistory: StateFlow<List<PlaybackHistoryEntry>> = _playbackHistory.asStateFlow()
-    
-    private val _isLoadingHistory = MutableStateFlow(false)
-    val isLoadingHistory: StateFlow<Boolean> = _isLoadingHistory.asStateFlow()
-    
-    private val _hasMoreHistory = MutableStateFlow(true)
-    val hasMoreHistory: StateFlow<Boolean> = _hasMoreHistory.asStateFlow()
-    
-    private var historyBeforeId: Long? = null
-    
+
+    private val _playlistError = MutableStateFlow<String?>(null)
+    val playlistError: StateFlow<String?> = _playlistError.asStateFlow()
+
+    init {
+        refreshPlaylists()
+    }
+
+    // ---------------------------------------------------------------------------
+    // Read
+    // ---------------------------------------------------------------------------
+
     /**
-     * Loads all playlists from the database.
+     * Reloads all playlists from the repository and updates derived state.
      */
-    fun loadPlaylists() {
+    fun refreshPlaylists() {
         viewModelScope.launch {
             _isLoading.value = true
-            _error.value = null
-            
+            _playlistError.value = null
             try {
-                val playlists = playlistRepository.getPlaylists()
-                _playlists.value = playlists
+                val loaded = playlistRepository.getPlaylists()
+                _playlists.value = loaded
+                _likedPlaylist.value = loaded.firstOrNull {
+                    it.name.equals(LIKED_SONGS_NAME, ignoreCase = true)
+                }
+                // Keep selectedPlaylist in sync with refreshed data so callers see updated tracks.
+                val current = _selectedPlaylist.value
+                if (current != null) {
+                    _selectedPlaylist.value = loaded.firstOrNull { it.id == current.id }
+                }
             } catch (e: Exception) {
-                _error.value = "Failed to load playlists: ${e.message}"
+                _playlistError.value = e.message ?: "Failed to load playlists"
             } finally {
                 _isLoading.value = false
             }
         }
     }
-    
+
+    // ---------------------------------------------------------------------------
+    // Selection
+    // ---------------------------------------------------------------------------
+
     /**
-     * Creates a new playlist with the given name.
+     * Sets the currently selected playlist for the detail view.
+     * Pass null to deselect.
+     */
+    fun selectPlaylist(playlist: SavedPlaylist?) {
+        _selectedPlaylist.value = playlist
+    }
+
+    // ---------------------------------------------------------------------------
+    // Create / Delete / Rename
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Creates a new playlist with the given name and refreshes the list.
      */
     fun createPlaylist(name: String) {
+        val trimmedName = name.trim()
+        if (trimmedName.isEmpty()) {
+            _playlistError.value = "Playlist name cannot be empty"
+            return
+        }
         viewModelScope.launch {
             _isLoading.value = true
-            _error.value = null
-            
+            _playlistError.value = null
             try {
-                val id = playlistRepository.createPlaylist(name)
-                loadPlaylists() // Refresh the list
+                playlistRepository.createPlaylist(trimmedName)
+                refreshPlaylists()
             } catch (e: Exception) {
-                _error.value = "Failed to create playlist: ${e.message}"
+                _playlistError.value = e.message ?: "Failed to create playlist"
             } finally {
                 _isLoading.value = false
             }
         }
     }
-    
+
     /**
-     * Deletes a playlist.
+     * Deletes a playlist and refreshes the list.
      */
-    fun deletePlaylist(playlistId: Long) {
+    fun deletePlaylist(playlist: SavedPlaylist) {
         viewModelScope.launch {
             _isLoading.value = true
-            _error.value = null
-            
+            _playlistError.value = null
             try {
-                playlistRepository.deletePlaylist(playlistId)
-                loadPlaylists() // Refresh the list
+                playlistRepository.deletePlaylist(playlist.id)
+                // Deselect if the deleted playlist was selected.
+                if (_selectedPlaylist.value?.id == playlist.id) {
+                    _selectedPlaylist.value = null
+                }
+                refreshPlaylists()
             } catch (e: Exception) {
-                _error.value = "Failed to delete playlist: ${e.message}"
+                _playlistError.value = e.message ?: "Failed to delete playlist"
             } finally {
                 _isLoading.value = false
             }
         }
     }
-    
+
     /**
-     * Adds a track to a playlist.
+     * Renames a playlist to [newName].
+     *
+     * TODO: Implement once PlaylistRepository/PlaylistStore exposes a renamePlaylist method.
+     *       PlaylistStore currently has no UPDATE on the playlists table.
      */
-    fun addTrack(playlistId: Long, trackUri: String) {
+    fun renamePlaylist(playlist: SavedPlaylist, newName: String) {
+        val trimmedName = newName.trim()
+        if (trimmedName.isEmpty()) {
+            _playlistError.value = "Playlist name cannot be empty"
+            return
+        }
+        // TODO: call playlistRepository.renamePlaylist(playlist.id, trimmedName) when available
+        _playlistError.value = "Rename not yet supported by the repository"
+    }
+
+    // ---------------------------------------------------------------------------
+    // Track operations
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Adds [trackUri] to [playlist] and refreshes the list.
+     */
+    fun addTrackToPlaylist(playlist: SavedPlaylist, trackUri: String) {
         viewModelScope.launch {
+            _playlistError.value = null
             try {
-                val added = playlistRepository.addTrack(playlistId, trackUri)
-                if (added) {
-                    loadPlaylists() // Refresh to show updated track counts
+                playlistRepository.addTrack(playlist.id, trackUri)
+                refreshPlaylists()
+            } catch (e: Exception) {
+                _playlistError.value = e.message ?: "Failed to add track to playlist"
+            }
+        }
+    }
+
+    /**
+     * Removes [trackUri] from [playlist] and refreshes the list.
+     */
+    fun removeTrackFromPlaylist(playlist: SavedPlaylist, trackUri: String) {
+        viewModelScope.launch {
+            _playlistError.value = null
+            try {
+                playlistRepository.removeTrack(playlist.id, trackUri)
+                refreshPlaylists()
+            } catch (e: Exception) {
+                _playlistError.value = e.message ?: "Failed to remove track from playlist"
+            }
+        }
+    }
+
+    /**
+     * Moves the track at [fromIndex] to [toIndex] within [playlist] and refreshes the list.
+     */
+    fun reorderTrack(playlist: SavedPlaylist, fromIndex: Int, toIndex: Int) {
+        if (fromIndex == toIndex) return
+        viewModelScope.launch {
+            _playlistError.value = null
+            try {
+                playlistRepository.moveTrack(playlist.id, fromIndex, toIndex)
+                refreshPlaylists()
+            } catch (e: Exception) {
+                _playlistError.value = e.message ?: "Failed to reorder track"
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Toggle like
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Adds [trackUri] to the Liked Songs playlist, or removes it if already present.
+     * If the Liked Songs playlist does not exist yet it is created automatically.
+     */
+    fun toggleLike(trackUri: String) {
+        viewModelScope.launch {
+            _playlistError.value = null
+            try {
+                val currentLiked = _likedPlaylist.value
+                if (currentLiked != null && trackUri in currentLiked.tracks) {
+                    // Already liked — remove.
+                    playlistRepository.removeTrack(currentLiked.id, trackUri)
                 } else {
-                    _error.value = "Track already in playlist or playlist not found"
+                    // Not liked — ensure the playlist exists, then add.
+                    val playlistId = currentLiked?.id
+                        ?: playlistRepository.createPlaylist(LIKED_SONGS_NAME)
+                    playlistRepository.addTrack(playlistId, trackUri)
                 }
+                refreshPlaylists()
             } catch (e: Exception) {
-                _error.value = "Failed to add track: ${e.message}"
+                _playlistError.value = e.message ?: "Failed to toggle like"
             }
         }
     }
-    
+
+    // ---------------------------------------------------------------------------
+    // M3U import / export
+    // ---------------------------------------------------------------------------
+
     /**
-     * Removes a track from a playlist.
+     * Imports a playlist from an M3U file at [uri].
+     *
+     * TODO: Implement once PlaylistRepository exposes M3U import support.
+     *       Currently, M3U parsing lives in MainActivity.importPlaylistM3u() and relies on
+     *       ContentResolver access that requires AndroidViewModel or a use-case layer.
      */
-    fun removeTrack(playlistId: Long, trackUri: String) {
-        viewModelScope.launch {
-            try {
-                val removed = playlistRepository.removeTrack(playlistId, trackUri)
-                if (removed) {
-                    loadPlaylists() // Refresh to show updated track counts
-                }
-            } catch (e: Exception) {
-                _error.value = "Failed to remove track: ${e.message}"
-            }
-        }
+    fun importM3U(uri: Uri) {
+        // TODO: parse the M3U file via ContentResolver, resolve tracks, and call
+        //       playlistRepository.createPlaylist() + playlistRepository.addTrack() for each entry.
+        _playlistError.value = "M3U import not yet implemented in the ViewModel layer"
     }
-    
+
     /**
-     * Moves a track to a new position within a playlist.
+     * Exports [playlist] as an M3U file to [uri].
+     *
+     * TODO: Implement once PlaylistRepository exposes M3U export support or a use-case is added.
+     *       Export requires resolving track metadata (ContentResolver / file path) and writing to
+     *       a Uri via ContentResolver.openOutputStream(), which needs an Application context
+     *       (AndroidViewModel) or a dedicated IO use-case.
      */
-    fun moveTrack(playlistId: Long, fromIndex: Int, toIndex: Int) {
-        viewModelScope.launch {
-            try {
-                playlistRepository.moveTrack(playlistId, fromIndex, toIndex)
-                loadPlaylists() // Refresh to show updated order
-            } catch (e: Exception) {
-                _error.value = "Failed to move track: ${e.message}"
-            }
-        }
+    fun exportM3U(playlist: SavedPlaylist, uri: Uri) {
+        // TODO: resolve each playlist.tracks entry to a file path via PlaylistRepository
+        //       .getTrackMetadata(), build "#EXTM3U\n#EXTINF:..." lines, and write to the Uri.
+        _playlistError.value = "M3U export not yet implemented in the ViewModel layer"
     }
-    
+
+    // ---------------------------------------------------------------------------
+    // Utility
+    // ---------------------------------------------------------------------------
+
     /**
-     * Gets metadata for a specific track.
-     */
-    suspend fun getTrackMetadata(trackUri: String): SavedTrackMetadata? {
-        return try {
-            playlistRepository.getTrackMetadata(trackUri)
-        } catch (e: Exception) {
-            _error.value = "Failed to get track metadata: ${e.message}"
-            null
-        }
-    }
-    
-    /**
-     * Saves or updates track metadata.
-     */
-    fun saveTrackMetadata(
-        trackUri: String,
-        title: String,
-        artist: String,
-        album: String,
-        durationMs: Long?,
-        artworkPath: String?,
-    ) {
-        viewModelScope.launch {
-            try {
-                playlistRepository.saveTrackMetadata(
-                    trackUri,
-                    title,
-                    artist,
-                    album,
-                    durationMs,
-                    artworkPath,
-                )
-            } catch (e: Exception) {
-                _error.value = "Failed to save metadata: ${e.message}"
-            }
-        }
-    }
-    
-    /**
-     * Records a playback history entry.
-     */
-    fun recordPlayback(
-        trackUri: String,
-        title: String,
-        artist: String,
-        album: String,
-        durationMs: Long,
-        playedAt: Long = System.currentTimeMillis(),
-    ) {
-        viewModelScope.launch {
-            try {
-                playlistRepository.recordPlayback(trackUri, title, artist, album, durationMs, playedAt)
-            } catch (e: Exception) {
-                // Don't show error for history recording failures
-                android.util.Log.e("PlaylistViewModel", "Failed to record playback", e)
-            }
-        }
-    }
-    
-    /**
-     * Loads playback history with pagination.
-     */
-    fun loadPlaybackHistory(loadMore: Boolean = false) {
-        viewModelScope.launch {
-            if (loadMore && !_hasMoreHistory.value) return@launch
-            
-            _isLoadingHistory.value = true
-            _error.value = null
-            
-            try {
-                val beforeId = if (loadMore) historyBeforeId else null
-                val entries = playlistRepository.getPlaybackHistory(AppConfig.HISTORY_PAGE_SIZE, beforeId)
-                
-                if (loadMore) {
-                    _playbackHistory.value = _playbackHistory.value + entries
-                } else {
-                    _playbackHistory.value = entries
-                }
-                
-                _hasMoreHistory.value = entries.size == AppConfig.HISTORY_PAGE_SIZE
-                historyBeforeId = entries.lastOrNull()?.id
-            } catch (e: Exception) {
-                _error.value = "Failed to load playback history: ${e.message}"
-            } finally {
-                _isLoadingHistory.value = false
-            }
-        }
-    }
-    
-    /**
-     * Deletes a specific playback history entry.
-     */
-    fun deletePlaybackHistoryEntry(id: Long) {
-        viewModelScope.launch {
-            try {
-                playlistRepository.deletePlaybackHistoryEntry(id)
-                loadPlaybackHistory() // Refresh the list
-            } catch (e: Exception) {
-                _error.value = "Failed to delete history entry: ${e.message}"
-            }
-        }
-    }
-    
-    /**
-     * Clears all playback history.
-     */
-    fun clearPlaybackHistory() {
-        viewModelScope.launch {
-            _isLoadingHistory.value = true
-            _error.value = null
-            
-            try {
-                playlistRepository.clearPlaybackHistory()
-                _playbackHistory.value = emptyList()
-                historyBeforeId = null
-                _hasMoreHistory.value = true
-            } catch (e: Exception) {
-                _error.value = "Failed to clear history: ${e.message}"
-            } finally {
-                _isLoadingHistory.value = false
-            }
-        }
-    }
-    
-    /**
-     * Finds the "Liked Songs" playlist (case-insensitive).
-     */
-    fun findLikedPlaylist(likedName: String): SavedPlaylist? {
-        return _playlists.value.firstOrNull { it.name.equals(likedName, ignoreCase = true) }
-    }
-    
-    /**
-     * Clears the error message.
+     * Clears the current error message.
      */
     fun clearError() {
-        _error.value = null
+        _playlistError.value = null
     }
 }

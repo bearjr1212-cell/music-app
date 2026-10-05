@@ -3,6 +3,7 @@ package io.github.ytdlpandroid.viewmodel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import io.github.ytdlpandroid.AppConfig
 import io.github.ytdlpandroid.DownloadJob
 import io.github.ytdlpandroid.DownloadService
 import io.github.ytdlpandroid.repository.DownloadRepository
@@ -14,256 +15,260 @@ import org.json.JSONArray
 import javax.inject.Inject
 
 /**
- * ViewModel for managing download queue and settings.
- * Handles download job management, format selection, and queue operations.
+ * ViewModel for managing the download queue.
+ * Holds observable download state and delegates data operations to DownloadRepository.
+ * MainActivity remains the DownloadService binding point and pushes state in via setDownloadService / updateJobs.
  */
 @HiltViewModel
 class DownloadViewModel @Inject constructor(
     private val downloadRepository: DownloadRepository,
 ) : ViewModel() {
-    
-    // Download queue state
+
+    // Allowed format keys — mirrors the array in MainActivity
+    private val allowedFormats = setOf("best", "1080p", "720p", "480p", "audio", "audio_mp3")
+
+    // ── Download jobs ─────────────────────────────────────────────────────────
+
     private val _downloadJobs = MutableStateFlow<List<DownloadJob>>(emptyList())
     val downloadJobs: StateFlow<List<DownloadJob>> = _downloadJobs.asStateFlow()
-    
+
+    // ── Loading / error ───────────────────────────────────────────────────────
+
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
-    
-    private val _error = MutableStateFlow<String?>(null)
-    val error: StateFlow<String?> = _error.asStateFlow()
-    
-    // Download settings
-    private val _formatMode = MutableStateFlow("best")
-    val formatMode: StateFlow<String> = _formatMode.asStateFlow()
-    
-    private val _allowPlaylist = MutableStateFlow(false)
-    val allowPlaylist: StateFlow<Boolean> = _allowPlaylist.asStateFlow()
-    
-    private val _maxConcurrentDownloads = MutableStateFlow(3)
-    val maxConcurrentDownloads: StateFlow<Int> = _maxConcurrentDownloads.asStateFlow()
-    
+
+    private val _downloadError = MutableStateFlow<String?>(null)
+    val downloadError: StateFlow<String?> = _downloadError.asStateFlow()
+
+    // ── Concurrency setting ───────────────────────────────────────────────────
+
+    private val _concurrentDownloads = MutableStateFlow(AppConfig.DEFAULT_MAX_CONCURRENT_DOWNLOADS)
+    val concurrentDownloads: StateFlow<Int> = _concurrentDownloads.asStateFlow()
+
+    // ── Wi-Fi only ────────────────────────────────────────────────────────────
+
     private val _wifiOnly = MutableStateFlow(false)
     val wifiOnly: StateFlow<Boolean> = _wifiOnly.asStateFlow()
-    
-    // Service reference
+
+    // ── Selected format ───────────────────────────────────────────────────────
+
+    private val _selectedFormat = MutableStateFlow("best")
+    val selectedFormat: StateFlow<String> = _selectedFormat.asStateFlow()
+
+    // ── DownloadService reference (set by MainActivity) ───────────────────────
+
     private var downloadService: DownloadService? = null
-    
+
     /**
-     * Sets the download service reference.
+     * Sets the DownloadService reference so the ViewModel can delegate service-only
+     * operations (pause, wifiOnly, concurrency) without binding directly.
+     * Call from MainActivity's ServiceConnection callbacks.
      */
     fun setDownloadService(service: DownloadService?) {
         downloadService = service
-        service?.setListener(downloadListener)
-        // Load initial settings
-        _maxConcurrentDownloads.value = service?.getMaxConcurrentDownloads() ?: 3
-        _wifiOnly.value = service?.getWifiOnly() ?: false
-        loadJobs()
-    }
-    
-    /**
-     * Listener for download service updates.
-     */
-    private val downloadListener = object : DownloadService.Listener {
-        override fun onDownloadState(
-            message: String,
-            active: Boolean,
-            paused: Boolean,
-            canPause: Boolean,
-            canCancel: Boolean,
-            percent: Int?,
-        ) {
-            // Update message could be handled here if needed
-        }
-        
-        override fun onQueueChanged(jobs: List<DownloadJob>) {
-            _downloadJobs.value = jobs
+        if (service != null) {
+            // Sync observable state from the service's persisted values on connect
+            _concurrentDownloads.value = service.getMaxConcurrentDownloads()
+            _wifiOnly.value = service.getWifiOnly()
         }
     }
-    
+
+    // ── Jobs list sync ────────────────────────────────────────────────────────
+
     /**
-     * Loads all download jobs from the queue.
+     * Pushes a fresh job list received from service callbacks into observable state.
+     * MainActivity calls this whenever the service reports a queue change.
      */
-    fun loadJobs() {
+    fun updateJobs(jobs: List<DownloadJob>) {
+        _downloadJobs.value = jobs
+    }
+
+    /**
+     * Reloads the job list from DownloadRepository on IO.
+     */
+    fun refreshJobs() {
         viewModelScope.launch {
             _isLoading.value = true
-            _error.value = null
-            
             try {
-                val jobs = downloadRepository.getJobs()
-                _downloadJobs.value = jobs
+                _downloadJobs.value = downloadRepository.getJobs()
             } catch (e: Exception) {
-                _error.value = "Failed to load download jobs: ${e.message}"
+                _downloadError.value = e.message ?: "Failed to load jobs"
             } finally {
                 _isLoading.value = false
             }
         }
     }
-    
+
+    // ── Enqueue ───────────────────────────────────────────────────────────────
+
     /**
-     * Enqueues URLs for download.
+     * Validates [urls] then enqueues them via DownloadRepository.
+     *
+     * Validation rules:
+     *  - List must not be empty
+     *  - At most [AppConfig.MAX_URL_COUNT] URLs (after deduplication by lowercase)
+     *  - Every URL must start with "http://" or "https://"
+     *
+     * @return [Result.success] with the new job id, or [Result.failure] with a descriptive error.
      */
-    fun enqueueUrls(urls: List<String>) {
+    suspend fun enqueueUrls(
+        urls: List<String>,
+        formatMode: String = _selectedFormat.value,
+        allowPlaylist: Boolean = false,
+    ): Result<Long> {
+        val deduped = urls.distinctBy { it.lowercase() }
+
+        if (deduped.isEmpty()) {
+            return Result.failure(IllegalArgumentException("No URLs provided"))
+        }
+        if (deduped.size > AppConfig.MAX_URL_COUNT) {
+            return Result.failure(
+                IllegalArgumentException(
+                    "Too many URLs: ${deduped.size} exceeds the limit of ${AppConfig.MAX_URL_COUNT}",
+                ),
+            )
+        }
+        val invalid = deduped.filterNot { it.startsWith("http://") || it.startsWith("https://") }
+        if (invalid.isNotEmpty()) {
+            return Result.failure(
+                IllegalArgumentException(
+                    "Invalid URL(s): ${invalid.take(3).joinToString()}" +
+                        if (invalid.size > 3) " … and ${invalid.size - 3} more" else "",
+                ),
+            )
+        }
+
+        return try {
+            val jobId = downloadRepository.enqueue(
+                urlsJson = JSONArray(deduped).toString(),
+                format = formatMode,
+                allowPlaylist = allowPlaylist,
+            )
+            Result.success(jobId)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // ── Job controls ──────────────────────────────────────────────────────────
+
+    /**
+     * Pauses a running job. Delegates to DownloadService (no repository method for pause).
+     * No-ops silently when the service is not yet connected.
+     */
+    fun pauseJob(jobId: Long) {
+        downloadService?.pauseJob(jobId) ?: run {
+            _downloadError.value = "Download service unavailable"
+        }
+    }
+
+    /**
+     * Resumes a paused job via DownloadRepository.
+     */
+    fun resumeJob(jobId: Long) {
         viewModelScope.launch {
-            _isLoading.value = true
-            _error.value = null
-            
             try {
-                val urlsJson = JSONArray(urls).toString()
-                val id = downloadRepository.enqueue(
-                    urlsJson,
-                    _formatMode.value,
-                    _allowPlaylist.value,
-                )
-                
-                // Resume queued jobs via service
-                downloadService?.resumeQueuedJobs()
-                loadJobs()
+                downloadRepository.resumeJob(jobId)
             } catch (e: Exception) {
-                _error.value = "Failed to enqueue download: ${e.message}"
-            } finally {
-                _isLoading.value = false
+                _downloadError.value = e.message ?: "Failed to resume job"
             }
         }
     }
-    
+
     /**
-     * Cancels a download job.
+     * Cancels a queued or paused job via DownloadRepository.
      */
-    fun cancelJob(id: Long) {
-        downloadService?.cancelJob(id)
-    }
-    
-    /**
-     * Retries a failed download job.
-     */
-    fun retryJob(id: Long) {
-        downloadService?.retryJob(id)
-    }
-    
-    /**
-     * Resumes a paused download job.
-     */
-    fun resumeJob(id: Long) {
-        downloadService?.resumeJob(id)
-    }
-    
-    /**
-     * Pauses a download job.
-     */
-    fun pauseJob(id: Long) {
-        downloadService?.pauseJob(id)
-    }
-    
-    /**
-     * Moves a job to the front of the queue.
-     */
-    fun moveJobToFront(id: Long) {
-        downloadService?.moveJobToFront(id)
-    }
-    
-    /**
-     * Clears all finished jobs from the queue.
-     */
-    fun clearFinished() {
+    fun cancelJob(jobId: Long) {
         viewModelScope.launch {
             try {
-                val removed = downloadService?.clearFinished() ?: return@launch
-                if (removed > 0) {
-                    loadJobs()
-                }
+                downloadRepository.cancelJob(jobId)
             } catch (e: Exception) {
-                _error.value = "Failed to clear finished jobs: ${e.message}"
+                _downloadError.value = e.message ?: "Failed to cancel job"
             }
         }
     }
-    
+
     /**
-     * Sets the download format mode.
+     * Retries a failed, partial, or canceled job via DownloadRepository.
      */
-    fun setFormatMode(mode: String) {
-        _formatMode.value = mode
-    }
-    
-    /**
-     * Sets whether to download playlists.
-     */
-    fun setAllowPlaylist(allow: Boolean) {
-        _allowPlaylist.value = allow
-    }
-    
-    /**
-     * Sets the maximum number of concurrent downloads.
-     */
-    fun setMaxConcurrentDownloads(max: Int) {
-        val bounded = max.coerceIn(1, 10)
-        _maxConcurrentDownloads.value = bounded
-        downloadService?.setMaxConcurrentDownloads(bounded)
-    }
-    
-    /**
-     * Sets whether downloads should only occur on Wi-Fi.
-     */
-    fun setWifiOnly(wifiOnly: Boolean) {
-        _wifiOnly.value = wifiOnly
-        downloadService?.setWifiOnly(wifiOnly)
-    }
-    
-    /**
-     * Resumes all queued jobs.
-     */
-    fun resumeQueuedJobs() {
-        downloadService?.resumeQueuedJobs()
-    }
-    
-    /**
-     * Gets the count of queued jobs.
-     */
-    suspend fun countQueued(): Int {
-        return try {
-            downloadRepository.countQueued()
-        } catch (e: Exception) {
-            _error.value = "Failed to count queued jobs: ${e.message}"
-            0
+    fun retryJob(jobId: Long) {
+        viewModelScope.launch {
+            try {
+                downloadRepository.retryJob(jobId)
+            } catch (e: Exception) {
+                _downloadError.value = e.message ?: "Failed to retry job"
+            }
         }
     }
-    
+
+    // ── Concurrency setting ───────────────────────────────────────────────────
+
     /**
-     * Gets the count of paused jobs.
+     * Sets the maximum concurrent downloads (clamped to 1–[AppConfig.MAX_CONCURRENT_DOWNLOADS]).
+     * Persisted via DownloadService, which owns the preference.
      */
-    suspend fun countPaused(): Int {
-        return try {
-            downloadRepository.countPaused()
-        } catch (e: Exception) {
-            _error.value = "Failed to count paused jobs: ${e.message}"
-            0
+    fun setConcurrentDownloads(n: Int) {
+        val clamped = n.coerceIn(1, AppConfig.MAX_CONCURRENT_DOWNLOADS)
+        _concurrentDownloads.value = clamped
+        downloadService?.setMaxConcurrentDownloads(clamped) ?: run {
+            _downloadError.value = "Download service unavailable"
         }
     }
-    
+
+    // ── Wi-Fi only ────────────────────────────────────────────────────────────
+
     /**
-     * Clears the error message.
+     * Enables or disables the Wi-Fi-only download policy.
+     * Persisted via DownloadService, which owns the preference.
+     */
+    fun setWifiOnly(enabled: Boolean) {
+        _wifiOnly.value = enabled
+        downloadService?.setWifiOnly(enabled) ?: run {
+            _downloadError.value = "Download service unavailable"
+        }
+    }
+
+    // ── Format selection ──────────────────────────────────────────────────────
+
+    /**
+     * Sets the active download format.
+     * Silently ignores values not in [allowedFormats].
+     */
+    fun setFormat(format: String) {
+        if (format !in allowedFormats) {
+            _downloadError.value = "Unknown format: $format"
+            return
+        }
+        _selectedFormat.value = format
+    }
+
+    // ── History ───────────────────────────────────────────────────────────────
+
+    /**
+     * Clears all completed, failed, partial, and canceled jobs via DownloadRepository.
+     */
+    fun clearCompletedJobs() {
+        viewModelScope.launch {
+            try {
+                downloadRepository.clearFinished()
+                refreshJobs()
+            } catch (e: Exception) {
+                _downloadError.value = e.message ?: "Failed to clear jobs"
+            }
+        }
+    }
+
+    // ── Utility ───────────────────────────────────────────────────────────────
+
+    /**
+     * Clears the current error message.
      */
     fun clearError() {
-        _error.value = null
+        _downloadError.value = null
     }
-    
-    /**
-     * Gets the format label for the current mode.
-     */
-    fun getFormatLabel(mode: String): String {
-        return when (mode) {
-            "best" -> "Best"
-            "1080p" -> "1080p"
-            "720p" -> "720p"
-            "480p" -> "480p"
-            "audio" -> "Audio"
-            "audio_mp3" -> "Audio (MP3)"
-            else -> "Best"
-        }
-    }
-    
+
     override fun onCleared() {
         super.onCleared()
-        downloadService?.setListener(null)
         downloadService = null
     }
 }
