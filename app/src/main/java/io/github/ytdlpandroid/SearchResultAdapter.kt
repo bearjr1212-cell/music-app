@@ -275,8 +275,9 @@ internal class SearchResultAdapter(
                         R.string.download_complete_accessibility,
                         result.title,
                     )
-                    downloadButton.setOnClickListener(null)
-                    downloadButton.isClickable = false
+                    // Still tappable: MainActivity asks before downloading another copy.
+                    downloadButton.isClickable = true
+                    downloadButton.setOnClickListener { callbacks.onSearchResultDownload(result) }
                 }
 
                 SearchDownloadStatus.PAUSED -> {

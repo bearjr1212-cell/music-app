@@ -256,6 +256,18 @@ class PlaylistStore(context: Context) : SQLiteOpenHelper(
     }
 
     @Synchronized
+    fun renamePlaylist(playlistId: Long, name: String): Boolean {
+        val normalizedName = name.trim()
+        require(normalizedName.isNotEmpty()) { "Playlist name cannot be empty" }
+        return writableDatabase.update(
+            "playlists",
+            ContentValues().apply { put("name", normalizedName) },
+            "id = ?",
+            arrayOf(playlistId.toString()),
+        ) > 0
+    }
+
+    @Synchronized
     fun addTrack(playlistId: Long, rawTrackUri: String): Boolean {
         if (rawTrackUri.isBlank()) return false
         val trackUri = canonical(rawTrackUri)

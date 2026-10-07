@@ -632,6 +632,22 @@ class MainActivity :
      * service, so it is read here rather than defaulted inside the ViewModel.
      */
     private fun queueSearchResultDownload(item: MusicSearchResult) {
+        val inLibrary = searchViewModel.isInLibrary(item.url)
+        val removed = searchViewModel.wasDownloadedButRemoved(item.url)
+        if (inLibrary || removed) {
+            AlertDialog.Builder(this)
+                .setTitle(item.title)
+                .setMessage(
+                    getString(if (inLibrary) R.string.already_downloaded_confirm else R.string.downloaded_then_removed_confirm)
+                )
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton(R.string.download_again) { _, _ ->
+                    saveSettings()
+                    searchViewModel.queueDownload(item, formatKeys[formatSpinner.selectedItemPosition])
+                }
+                .show()
+            return
+        }
         saveSettings()
         searchViewModel.queueDownload(item, formatKeys[formatSpinner.selectedItemPosition])
     }
@@ -2286,10 +2302,15 @@ class MainActivity :
                     searchViewModel.isSearching,
                     searchViewModel.isLoadingMore,
                     searchViewModel.searchError,
-                    searchViewModel.downloadStatusByUrl,
-                ) { results, isSearching, isLoadingMore, error, statusByUrl ->
+                    combine(
+                        searchViewModel.downloadStatusByUrl,
+                        searchViewModel.libraryVideoIds,
+                    ) { byUrl, libraryIds -> byUrl to libraryIds },
+                ) { results, isSearching, isLoadingMore, error, (statusByUrl, libraryIds) ->
                     val rows = ArrayList<SearchRow>(results.size + 2)
-                    results.forEach { rows += SearchRow.Result(it, statusByUrl[it.url]) }
+                    results.forEach {
+                        rows += SearchRow.Result(it, searchViewModel.downloadStateFor(it.url, statusByUrl, libraryIds))
+                    }
                     when {
                         results.isNotEmpty() && error != null ->
                             // A failed page with results already on screen: keep the list and
@@ -2338,7 +2359,10 @@ class MainActivity :
         ) return
 
         val contentHeight = searchScrollView.getChildAt(0)?.height ?: return
-        if (searchScrollView.scrollY + searchScrollView.height >= contentHeight - dp(320)) {
+        // Start fetching about two screens early so results are ready before the user reaches
+        // the end, like YouTube's endless feed.
+        val prefetchDistance = maxOf(dp(600), searchScrollView.height * 2)
+        if (searchScrollView.scrollY + searchScrollView.height >= contentHeight - prefetchDistance) {
             searchViewModel.loadNextPage()
         }
     }
@@ -2721,6 +2745,7 @@ class MainActivity :
             val tracks = mutableListOf<AudioTrack>()
             val errors = mutableListOf<String>()
             val cachedUris = mutableSetOf<String>()
+            val videoIds = mutableSetOf<String>()
             // One query up front, then map lookups: querying per MediaStore row here was an
             // N+1 against track_metadata for libraries with thousands of rows.
             val cachedMetadata = HashMap<String, SavedTrackMetadata>()
@@ -2737,6 +2762,7 @@ class MainActivity :
                     val uri = MediaUris.canonicalAudio(rawUri)
                     if (!cachedUris.add(uri.toString())) return@forEach
                     val name = displayName(uri)
+                    VideoIds.fromFileName(name)?.let(videoIds::add)
                     val artBytes = saved.artworkPath?.let { path ->
                         runCatching { File(path).takeIf(File::isFile)?.readBytes() }.getOrNull()
                     }
@@ -2779,6 +2805,7 @@ class MainActivity :
                         if (!isAudioUri(uri, mime)) continue
                         val name = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME))
                             ?: getString(R.string.unknown_track)
+                        VideoIds.fromFileName(name)?.let(videoIds::add)
                         if (uri.toString() in cachedUris) continue
                         try {
                             tracks.add(readTrack(uri, name, added, cachedMetadata[uri.toString()]))
@@ -2801,7 +2828,9 @@ class MainActivity :
                     if (!isAudioUri(parsed, contentResolver.getType(parsed))) return@forEach
                     val uri = MediaUris.canonicalAudio(parsed)
                     if (uri.toString() in cachedUris) return@forEach
-                    tracks.add(readTrack(uri, displayName(uri), cached = cachedMetadata[uri.toString()]))
+                    val name = displayName(uri)
+                    VideoIds.fromFileName(name)?.let(videoIds::add)
+                    tracks.add(readTrack(uri, name, cached = cachedMetadata[uri.toString()]))
                 } catch (error: Exception) {
                     errors.add(
                         getString(
@@ -2815,6 +2844,7 @@ class MainActivity :
             runOnUiThread {
                 if (destroyed) return@runOnUiThread
                 libraryViewModel.updateLibrary(unique, errors.distinct())
+                searchViewModel.setLibraryVideoIds(videoIds)
                 renderHomeLibrary()
                 refreshPlaybackHistoryViews()
                 refreshPlaylists()
@@ -3149,6 +3179,46 @@ class MainActivity :
         dialog.show()
     }
 
+    private fun promptRenamePlaylist(playlist: SavedPlaylist) {
+        val input = EditText(this).apply {
+            hint = getString(R.string.playlist_name)
+            isSingleLine = true
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                    android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            setText(playlist.name)
+            setSelection(text.length)
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(getString(R.string.rename_playlist))
+            .setView(input)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.rename, null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val name = input.text.toString().trim()
+                if (name.isEmpty()) {
+                    input.error = getString(R.string.playlist_name_required)
+                    return@setOnClickListener
+                }
+                if (name == playlist.name) {
+                    dialog.dismiss()
+                    return@setOnClickListener
+                }
+                val duplicate = playlistViewModel.playlists.value.any {
+                    it.id != playlist.id && it.name.equals(name, ignoreCase = true)
+                }
+                if (duplicate || name.equals(getString(R.string.liked_songs), ignoreCase = true)) {
+                    input.error = getString(R.string.playlist_name_exists)
+                    return@setOnClickListener
+                }
+                playlistViewModel.renamePlaylist(playlist, name)
+                dialog.dismiss()
+            }
+        }
+        dialog.show()
+    }
+
     private fun refreshPlaylists() {
         playlistViewModel.refreshPlaylists()
     }
@@ -3225,13 +3295,18 @@ class MainActivity :
             menu.add(0, 0, 0, R.string.play)
             menu.add(0, 1, 1, R.string.add_tracks)
             menu.add(0, 2, 2, R.string.share_playlist)
-            menu.add(0, 3, 3, R.string.delete)
+            // Liked Songs is found by name, so renaming it would orphan the like button.
+            if (!playlist.name.equals(getString(R.string.liked_songs), ignoreCase = true)) {
+                menu.add(0, 4, 3, R.string.rename_playlist)
+            }
+            menu.add(0, 3, 4, R.string.delete)
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
                     0 -> loadPlaylistAndPlay(playlist.id)
                     1 -> chooseTracksForPlaylist(playlist.id)
                     2 -> sharePlaylistM3u(playlist)
                     3 -> confirmDeletePlaylist(playlist.id, playlist.name)
+                    4 -> promptRenamePlaylist(playlist)
                 }
                 true
             }

@@ -24,6 +24,7 @@ class FakeState:
     options_history: list[dict[str, Any]] = field(default_factory=list)
     track_info: dict[str, Any] = field(default_factory=dict)
     search_info: dict[str, Any] | None = None
+    search_calls: list[str] = field(default_factory=list)
 
 
 FAKE_STATE = FakeState()
@@ -87,8 +88,15 @@ class FakeYoutubeDL:
                 hook({"status": "finished", "filename": filename, "info_dict": info})
         return FAKE_STATE.result_code
 
-    def extract_info(self, url: str, download: bool = False) -> dict[str, Any] | None:
-        return FAKE_STATE.search_info
+    def extract_info(self, url: str, download: bool = False, process: bool = True) -> dict[str, Any] | None:
+        FAKE_STATE.search_calls.append(url)
+        if FAKE_STATE.search_info is None:
+            return None
+        # Mirror yt-dlp's lazy search: entries arrive as a one-shot iterator.
+        return {**FAKE_STATE.search_info, "entries": iter(FAKE_STATE.search_info.get("entries") or [])}
+
+    def close(self) -> None:
+        pass
 
 
 class DownloaderTests(unittest.TestCase):
@@ -101,6 +109,7 @@ class DownloaderTests(unittest.TestCase):
         FAKE_STATE.options_history.clear()
         FAKE_STATE.track_info.clear()
         FAKE_STATE.search_info = None
+        FAKE_STATE.search_calls.clear()
 
         module_patch = patch.dict(sys.modules, {"yt_dlp": types.SimpleNamespace(YoutubeDL=FakeYoutubeDL)})
         module_patch.start()
@@ -243,7 +252,34 @@ class DownloaderTests(unittest.TestCase):
         self.assertEqual(len(results), 5)
         self.assertEqual(results[0]["title"], "Song 20")
         self.assertEqual(results[-1]["title"], "Song 24")
-        self.assertEqual(FAKE_STATE.options["playlistend"], 40)
+        self.assertEqual(FAKE_STATE.search_calls, ["ytsearchall:songs"])
+
+    def test_search_pages_reuse_one_session_until_new_search(self):
+        FAKE_STATE.search_info = {"entries": [
+            {"id": f"video-{index}", "title": f"Song {index}"}
+            for index in range(45)
+        ]}
+
+        first = json.loads(self.downloader.search_music("songs", FakeCallback(), 0, 20))
+        second = json.loads(self.downloader.search_music("songs", FakeCallback(), 20, 20))
+        third = json.loads(self.downloader.search_music("songs", FakeCallback(), 40, 20))
+        self.assertEqual([len(first), len(second), len(third)], [20, 20, 5])
+        self.assertEqual(second[0]["title"], "Song 20")
+        # Later pages continue the open stream instead of re-running the search.
+        self.assertEqual(FAKE_STATE.search_calls, ["ytsearchall:songs"])
+
+        self.downloader.search_music("songs", FakeCallback(), 0, 20)
+        self.assertEqual(len(FAKE_STATE.search_calls), 2)
+
+    def test_search_skips_channel_and_playlist_entries(self):
+        FAKE_STATE.search_info = {"entries": [
+            {"id": "UCchannel", "title": "A channel", "ie_key": "YoutubeTab"},
+            {"id": "video-1", "title": "Song", "ie_key": "Youtube"},
+        ]}
+
+        results = json.loads(self.downloader.search_music("songs", FakeCallback()))
+
+        self.assertEqual([result["id"] for result in results], ["video-1"])
 
     def test_search_rejects_invalid_page_bounds(self):
         for offset, limit in ((-1, 20), (0, 0), (0, 51), (True, 20)):

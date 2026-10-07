@@ -161,10 +161,7 @@ class PlaylistViewModel @Inject constructor(
     }
 
     /**
-     * Renames a playlist to [newName].
-     *
-     * TODO: Implement once PlaylistRepository/PlaylistStore exposes a renamePlaylist method.
-     *       PlaylistStore currently has no UPDATE on the playlists table.
+     * Renames a playlist to [newName] and refreshes the list.
      */
     fun renamePlaylist(playlist: SavedPlaylist, newName: String) {
         val trimmedName = newName.trim()
@@ -172,8 +169,15 @@ class PlaylistViewModel @Inject constructor(
             _playlistError.value = "Playlist name cannot be empty"
             return
         }
-        // TODO: call playlistRepository.renamePlaylist(playlist.id, trimmedName) when available
-        _playlistError.value = "Rename not yet supported by the repository"
+        viewModelScope.launch {
+            _playlistError.value = null
+            try {
+                playlistRepository.renamePlaylist(playlist.id, trimmedName)
+                refreshPlaylists()
+            } catch (e: Exception) {
+                _playlistError.value = e.message ?: "Failed to rename playlist"
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------

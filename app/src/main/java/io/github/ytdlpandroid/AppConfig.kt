@@ -15,7 +15,7 @@ object AppConfig {
     const val MAX_URL_COUNT = 100
 
     // Search pagination
-    const val SEARCH_PAGE_SIZE = 20
+    const val SEARCH_PAGE_SIZE = 30
 
     // Playback history pagination
     const val HISTORY_PAGE_SIZE = 50

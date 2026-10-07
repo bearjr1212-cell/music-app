@@ -203,6 +203,10 @@
     <string name="playlist_no_available_tracks">This playlist has no available tracks. Re-import missing files.</string>
     <string name="remove_track">Remove</string>
     <string name="playlist_label">Playlist</string>
+    <string name="rename_playlist">Rename playlist</string>
+    <string name="already_downloaded_confirm">This song is already in your library. Download another copy?</string>
+    <string name="downloaded_then_removed_confirm">You downloaded this before, but the file is no longer in your library. Download it again?</string>
+    <string name="download_again">Download again</string>
     <string name="playlist_summary">%1$d songs · %2$s</string>
     <string name="playlist_back">Back</string>
     <string name="playlist_shuffle_play">Shuffle play</string>

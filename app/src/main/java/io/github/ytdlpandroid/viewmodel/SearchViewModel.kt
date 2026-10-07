@@ -11,6 +11,7 @@ import io.github.ytdlpandroid.DownloadQueueStore
 import io.github.ytdlpandroid.DownloadService
 import io.github.ytdlpandroid.MusicSearchResult
 import io.github.ytdlpandroid.R
+import io.github.ytdlpandroid.VideoIds
 import io.github.ytdlpandroid.repository.PlaylistRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -63,6 +64,45 @@ class SearchViewModel @Inject constructor(
     private val _downloadStatusByUrl = MutableStateFlow<Map<String, SearchDownloadState>>(emptyMap())
     val downloadStatusByUrl: StateFlow<Map<String, SearchDownloadState>> = _downloadStatusByUrl.asStateFlow()
     
+    /** YouTube ids of files currently in the library, pushed by the library loader. */
+    private val _libraryVideoIds = MutableStateFlow<Set<String>>(emptySet())
+    val libraryVideoIds: StateFlow<Set<String>> = _libraryVideoIds.asStateFlow()
+
+    private var libraryLoaded = false
+
+    fun setLibraryVideoIds(ids: Set<String>) {
+        libraryLoaded = true
+        _libraryVideoIds.value = ids
+    }
+
+    /** True when the result's file is in the library right now. */
+    fun isInLibrary(url: String): Boolean =
+        VideoIds.fromUrl(url)?.let { it in _libraryVideoIds.value } == true
+
+    /** True when an earlier download finished but its file is no longer in the library. */
+    fun wasDownloadedButRemoved(url: String): Boolean =
+        libraryLoaded && !isInLibrary(url) &&
+            _downloadStatusByUrl.value[url]?.status == SearchDownloadStatus.COMPLETE
+
+    /**
+     * Queue state for a result, upgraded to COMPLETE when the file is already in the library
+     * (covers downloads whose queue entries were cleared, or that predate the queue).
+     */
+    fun downloadStateFor(
+        url: String,
+        byUrl: Map<String, SearchDownloadState>,
+        libraryIds: Set<String>,
+    ): SearchDownloadState? {
+        val job = byUrl[url]
+        val inLibrary = VideoIds.fromUrl(url)?.let { it in libraryIds } == true
+        if (!inLibrary) return job
+        return when (job?.status) {
+            null, SearchDownloadStatus.NONE, SearchDownloadStatus.RETRYABLE ->
+                SearchDownloadState(SearchDownloadStatus.COMPLETE, job?.jobId)
+            else -> job
+        }
+    }
+
     private var downloadService: DownloadService? = null
     
     /**
@@ -293,7 +333,7 @@ class SearchViewModel @Inject constructor(
     }
     
     private companion object {
-        const val SEARCH_PAGE_SIZE = 20
+        const val SEARCH_PAGE_SIZE = 30
     }
 }
 

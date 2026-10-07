@@ -42,6 +42,13 @@ class PlaylistRepository @Inject constructor(
     suspend fun createPlaylist(name: String): Long = withContext(Dispatchers.IO) {
         playlistStore.createPlaylist(name)
     }
+
+    /**
+     * Renames a playlist, returning false when it no longer exists.
+     */
+    suspend fun renamePlaylist(playlistId: Long, name: String): Boolean = withContext(Dispatchers.IO) {
+        playlistStore.renamePlaylist(playlistId, name)
+    }
     
     /**
      * Adds a track to a playlist.

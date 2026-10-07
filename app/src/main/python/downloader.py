@@ -2,7 +2,9 @@ import json
 import logging
 import math
 import os
+import threading
 import time
+from collections import OrderedDict
 from importlib import import_module
 from typing import Any
 from urllib.parse import urlsplit
@@ -14,6 +16,7 @@ MAX_URL_COUNT = 100
 MAX_URL_BYTES = 8192
 MAX_BATCH_BYTES = 65536
 SAFE_THUMBNAIL_HOSTS = {"i.ytimg.com"}
+MAX_SEARCH_SESSIONS = 4
 
 
 class DownloadCancelled(Exception):
@@ -166,6 +169,67 @@ def _validate_urls(urls_json):
     return urls
 
 
+class _SearchSession:
+    """An open YouTube search whose result stream is consumed incrementally.
+
+    Re-running ``ytsearchN`` for every page re-downloads all earlier results, so page N costs
+    N requests. Keeping the lazy ``ytsearchall`` iterator alive means each further page only
+    fetches YouTube's next continuation, which is what makes endless scrolling feel instant.
+    """
+
+    def __init__(self, query, callback):
+        self.lock = threading.Lock()
+        self.entries = []
+        self.exhausted = False
+        self.ydl = YoutubeDL({
+            "extract_flat": True,
+            "skip_download": True,
+            "quiet": True,
+            "no_warnings": False,
+            "logger": EventLogger(callback),
+        })
+        info = self.ydl.extract_info(f"ytsearchall:{query}", download=False, process=False)
+        self.iterator = iter((info or {}).get("entries") or [])
+
+    def fill(self, count):
+        while len(self.entries) < count and not self.exhausted:
+            try:
+                self.entries.append(next(self.iterator))
+            except StopIteration:
+                self.exhausted = True
+        return self.entries
+
+    def close(self):
+        close = getattr(self.ydl, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - closing is best effort
+                pass
+
+
+_search_sessions = OrderedDict()
+_search_sessions_lock = threading.Lock()
+
+
+def _search_session(query, callback, fresh):
+    with _search_sessions_lock:
+        session = _search_sessions.get(query)
+        if session is not None and not fresh:
+            _search_sessions.move_to_end(query)
+            return session
+        if session is not None:
+            session.close()
+            del _search_sessions[query]
+    session = _SearchSession(query, callback)
+    with _search_sessions_lock:
+        _search_sessions[query] = session
+        while len(_search_sessions) > MAX_SEARCH_SESSIONS:
+            _, evicted = _search_sessions.popitem(last=False)
+            evicted.close()
+    return session
+
+
 def search_music(query, callback, offset=0, limit=20):
     """Search YouTube with a bounded offset/limit and return normalized results."""
     if not isinstance(query, str):
@@ -180,18 +244,10 @@ def search_music(query, callback, offset=0, limit=20):
     end = offset + limit
 
     results = []
-    options = {
-        "extract_flat": True,
-        "skip_download": True,
-        "quiet": True,
-        "no_warnings": False,
-        "logger": EventLogger(callback),
-        "playlistend": end,
-    }
-    with YoutubeDL(options) as ydl:
-        info = ydl.extract_info(f"ytsearch{end}:{query}", download=False)
-
-    entries = ((info or {}).get("entries") or [])[offset:end]
+    # Offset 0 is a new search: start a fresh session so results are current.
+    session = _search_session(query, callback, fresh=offset == 0)
+    with session.lock:
+        entries = list(session.fill(end)[offset:end])
     for entry in entries:
         if not isinstance(entry, dict):
             continue
