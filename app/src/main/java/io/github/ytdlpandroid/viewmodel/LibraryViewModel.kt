@@ -70,9 +70,27 @@ class LibraryViewModel @Inject constructor(
     private val _libraryError = MutableStateFlow<String?>(null)
     val libraryError: StateFlow<String?> = _libraryError.asStateFlow()
 
+    // Accumulated per-track/load errors from the last library scan
+    private val _libraryErrors = MutableStateFlow<List<String>>(emptyList())
+    val libraryErrors: StateFlow<List<String>> = _libraryErrors.asStateFlow()
+
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
+
+    /**
+     * Pushes a freshly scanned library into observable state.
+     *
+     * `MainActivity.refreshLibrary()` — not [refreshLibrary] — is the authoritative loader:
+     * `TrackRepository.loadLibraryTracks()` filters on `IS_MUSIC`, and omits cached-metadata
+     * tracks (the only source when READ_AUDIO_LIBRARY is absent), imported URIs, artwork
+     * bytes and the accumulated error list, so its results must never replace this push.
+     */
+    fun updateLibrary(tracks: List<AudioTrack>, errors: List<String>) {
+        _tracks.value = tracks
+        _libraryErrors.value = errors
+        applyFiltersAndSort()
+    }
 
     /**
      * Sets the group mode and re-derives [filteredTracks].

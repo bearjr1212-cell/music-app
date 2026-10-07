@@ -83,6 +83,22 @@ class PlaylistViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Fetches a single playlist by case-insensitive name via a targeted query, including its
+     * tracks. The card menus call this to decide "like" vs "remove from liked"; a targeted lookup
+     * is used instead of the cached [likedPlaylist] snapshot because that snapshot can be stale or
+     * not-yet-loaded, and a null guess would offer the wrong action (and `toggleLike` behaves
+     * differently for a null playlist — it would create one). Failures are mapped onto
+     * [playlistError] like the other methods here, then rethrown so the caller can keep its own
+     * existing error UI rather than silently treating an error as "not liked".
+     */
+    suspend fun likedPlaylistNamed(name: String): SavedPlaylist? = try {
+        playlistRepository.findPlaylistByName(name)
+    } catch (e: Exception) {
+        _playlistError.value = e.message ?: "Failed to load playlists"
+        throw e
+    }
+
     // ---------------------------------------------------------------------------
     // Selection
     // ---------------------------------------------------------------------------

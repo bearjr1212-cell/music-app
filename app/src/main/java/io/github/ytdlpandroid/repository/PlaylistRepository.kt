@@ -28,7 +28,14 @@ class PlaylistRepository @Inject constructor(
     suspend fun getPlaylists(): List<SavedPlaylist> = withContext(Dispatchers.IO) {
         playlistStore.getPlaylists()
     }
-    
+
+    /**
+     * Retrieves a single playlist by case-insensitive name, including its tracks.
+     */
+    suspend fun findPlaylistByName(name: String): SavedPlaylist? = withContext(Dispatchers.IO) {
+        playlistStore.findPlaylistByName(name)
+    }
+
     /**
      * Creates a new playlist with the given name.
      */
@@ -41,6 +48,13 @@ class PlaylistRepository @Inject constructor(
      */
     suspend fun addTrack(playlistId: Long, trackUri: String): Boolean = withContext(Dispatchers.IO) {
         playlistStore.addTrack(playlistId, trackUri)
+    }
+
+    /**
+     * Adds many tracks to a playlist inside a single transaction, returning how many were added.
+     */
+    suspend fun addTracks(playlistId: Long, trackUris: List<String>): Int = withContext(Dispatchers.IO) {
+        playlistStore.addTracks(playlistId, trackUris)
     }
     
     /**

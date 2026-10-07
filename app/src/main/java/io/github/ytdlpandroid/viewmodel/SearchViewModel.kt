@@ -1,17 +1,22 @@
 package io.github.ytdlpandroid.viewmodel
 
+import android.content.Context
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
 import io.github.ytdlpandroid.DownloadJob
+import io.github.ytdlpandroid.DownloadQueueStore
 import io.github.ytdlpandroid.DownloadService
 import io.github.ytdlpandroid.MusicSearchResult
+import io.github.ytdlpandroid.R
 import io.github.ytdlpandroid.repository.PlaylistRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import org.json.JSONArray
 import javax.inject.Inject
 
 /**
@@ -20,6 +25,7 @@ import javax.inject.Inject
  */
 @HiltViewModel
 class SearchViewModel @Inject constructor(
+    @ApplicationContext private val context: Context,
     private val playlistRepository: PlaylistRepository,
 ) : ViewModel() {
     
@@ -45,11 +51,17 @@ class SearchViewModel @Inject constructor(
     // Pagination state
     private var searchOffset = 0
     private var searchRequestId = 0
-    private const val SEARCH_PAGE_SIZE = 20
     
     // Download state for search results
     private val _downloadJobs = MutableStateFlow<List<DownloadJob>>(emptyList())
     val downloadJobs: StateFlow<List<DownloadJob>> = _downloadJobs.asStateFlow()
+    
+    /**
+     * Pre-computed URL → download state, derived from [downloadJobs] in a single
+     * pass so the UI performs at most one lookup per indicator.
+     */
+    private val _downloadStatusByUrl = MutableStateFlow<Map<String, SearchDownloadState>>(emptyMap())
+    val downloadStatusByUrl: StateFlow<Map<String, SearchDownloadState>> = _downloadStatusByUrl.asStateFlow()
     
     private var downloadService: DownloadService? = null
     
@@ -61,10 +73,35 @@ class SearchViewModel @Inject constructor(
     }
     
     /**
-     * Updates the download jobs list from the service.
+     * Updates the download jobs list from the service and re-derives
+     * [downloadStatusByUrl] in a single pass over [jobs].
      */
     fun updateDownloadJobs(jobs: List<DownloadJob>) {
         _downloadJobs.value = jobs
+        _downloadStatusByUrl.value = deriveDownloadStatus(jobs)
+    }
+    
+    private fun deriveDownloadStatus(jobs: List<DownloadJob>): Map<String, SearchDownloadState> {
+        val byUrl = HashMap<String, SearchDownloadState>()
+        jobs.forEach { job ->
+            val urls = runCatching { JSONArray(job.urlsJson) }.getOrNull() ?: return@forEach
+            val status = when (job.state) {
+                DownloadQueueStore.STATE_RUNNING -> SearchDownloadStatus.DOWNLOADING
+                DownloadQueueStore.STATE_QUEUED -> SearchDownloadStatus.QUEUED
+                DownloadQueueStore.STATE_PAUSED -> SearchDownloadStatus.PAUSED
+                DownloadQueueStore.STATE_COMPLETE -> SearchDownloadStatus.COMPLETE
+                DownloadQueueStore.STATE_PARTIAL,
+                DownloadQueueStore.STATE_FAILED,
+                DownloadQueueStore.STATE_CANCELED -> SearchDownloadStatus.RETRYABLE
+                else -> SearchDownloadStatus.NONE
+            }
+            val state = SearchDownloadState(status, job.id)
+            for (index in 0 until urls.length()) {
+                val url = urls.optString(index)
+                if (url.isNotEmpty()) byUrl[url] = state
+            }
+        }
+        return byUrl
     }
     
     /**
@@ -73,13 +110,19 @@ class SearchViewModel @Inject constructor(
     fun search(query: String) {
         val trimmedQuery = query.trim()
         if (trimmedQuery.isEmpty()) {
-            _searchError.value = "Search query required"
+            _searchResults.value = emptyList()
+            _hasMoreResults.value = false
+            _searchError.value = context.getString(R.string.search_query_required)
             return
         }
         
         _searchQuery.value = trimmedQuery
         searchOffset = 0
+        // Invalidates any in-flight callback and releases the load guard so a new
+        // search is not swallowed by the previous one.
         searchRequestId++
+        _isSearching.value = false
+        _isLoadingMore.value = false
         _searchResults.value = emptyList()
         _hasMoreResults.value = true
         _searchError.value = null
@@ -91,10 +134,13 @@ class SearchViewModel @Inject constructor(
      * Loads the next page of search results.
      */
     fun loadNextPage(initial: Boolean = false) {
+        if (_isSearching.value || _isLoadingMore.value) return
+        if (!initial && !_hasMoreResults.value) return
+        
         val service = downloadService
         if (service == null) {
             if (initial) {
-                _searchError.value = "Search service unavailable"
+                _searchError.value = context.getString(R.string.search_service_unavailable)
                 _hasMoreResults.value = false
             }
             return
@@ -109,45 +155,52 @@ class SearchViewModel @Inject constructor(
             _isLoadingMore.value = true
         }
         
-        viewModelScope.launch {
-            try {
-                service.searchMusic(_searchQuery.value, offset, SEARCH_PAGE_SIZE) { result ->
-                    if (requestId != searchRequestId) return@searchMusic
-                    
-                    if (initial) {
-                        _isSearching.value = false
-                    } else {
-                        _isLoadingMore.value = false
-                    }
-                    
-                    result.fold(
-                        onSuccess = { items ->
-                            if (initial) {
-                                _searchResults.value = items
-                            } else {
-                                _searchResults.value = _searchResults.value + items
-                            }
-                            
-                            searchOffset += items.size
-                            _hasMoreResults.value = items.size == SEARCH_PAGE_SIZE
-                            
-                            if (items.isEmpty() && _searchResults.value.isEmpty()) {
-                                _searchError.value = "No results found"
-                            }
-                        },
-                        onFailure = { error ->
-                            _searchError.value = error.message ?: "Search failed"
-                            _hasMoreResults.value = false
-                        },
-                    )
+        try {
+            // DownloadService dispatches to its own executor and posts the callback
+            // back to the main looper, so this call does not block the caller.
+            service.searchMusic(_searchQuery.value, offset, SEARCH_PAGE_SIZE) { result ->
+                if (requestId != searchRequestId) return@searchMusic
+                
+                if (initial) {
+                    _isSearching.value = false
+                } else {
+                    _isLoadingMore.value = false
                 }
-            } catch (e: Exception) {
-                _isSearching.value = false
-                _isLoadingMore.value = false
-                _searchError.value = e.message ?: "Search failed"
+                
+                result.fold(
+                    onSuccess = { items ->
+                        val existing = if (initial) emptyList() else _searchResults.value
+                        val seen = existing.mapTo(HashSet()) { it.url }
+                        _searchResults.value = existing + items.filter { seen.add(it.url) }
+                        // The offset indexes the raw YouTube result list, which the Python side
+                        // trims (channels/playlists are dropped), so always advance a full page
+                        // and only stop once a page comes back empty.
+                        searchOffset += SEARCH_PAGE_SIZE
+                        _hasMoreResults.value = items.isNotEmpty()
+                        
+                        if (items.isEmpty() && _searchResults.value.isEmpty()) {
+                            _searchError.value = context.getString(R.string.search_no_results)
+                        }
+                    },
+                    onFailure = { error ->
+                        _searchError.value = searchFailureMessage(error.message)
+                        // Keep paging alive when results are already on screen so the
+                        // UI can offer a retry instead of dead-ending the list.
+                        _hasMoreResults.value = _searchResults.value.isNotEmpty()
+                    },
+                )
             }
+        } catch (e: Exception) {
+            _isSearching.value = false
+            _isLoadingMore.value = false
+            _searchError.value = searchFailureMessage(e.message)
         }
     }
+    
+    private fun searchFailureMessage(detail: String?): String = context.getString(
+        R.string.search_failed,
+        detail ?: context.getString(R.string.unknown_error),
+    )
     
     /**
      * Clears the current search results.
@@ -157,6 +210,8 @@ class SearchViewModel @Inject constructor(
         _searchResults.value = emptyList()
         _searchError.value = null
         _hasMoreResults.value = false
+        _isSearching.value = false
+        _isLoadingMore.value = false
         searchOffset = 0
         searchRequestId++
     }
@@ -182,25 +237,25 @@ class SearchViewModel @Inject constructor(
     }
     
     /**
-     * Queues a download for a search result.
+     * Queues a download for a search result using the caller's selected [format].
      */
-    fun queueDownload(item: MusicSearchResult) {
+    fun queueDownload(item: MusicSearchResult, format: String) {
         val service = downloadService ?: run {
-            _searchError.value = "Download service unavailable"
+            _searchError.value = context.getString(R.string.search_service_unavailable)
             return
         }
         
         try {
-            service.startServiceIntent(
-                android.content.Intent(service, DownloadService::class.java).apply {
-                    action = DownloadService.ACTION_ENQUEUE
-                    putExtra(DownloadService.EXTRA_URLS, org.json.JSONArray(listOf(item.url)).toString())
-                    putExtra(DownloadService.EXTRA_FORMAT, "best")
-                    putExtra(DownloadService.EXTRA_PLAYLIST, false)
-                },
+            service.enqueueUrls(
+                urlsJson = JSONArray(listOf(item.url)).toString(),
+                format = format,
+                allowPlaylist = false,
             )
         } catch (e: Exception) {
-            _searchError.value = "Failed to queue download: ${e.message}"
+            _searchError.value = context.getString(
+                R.string.download_error,
+                e.localizedMessage ?: e.javaClass.simpleName,
+            )
         }
     }
     
@@ -236,4 +291,21 @@ class SearchViewModel @Inject constructor(
         super.onCleared()
         downloadService = null
     }
+    
+    private companion object {
+        const val SEARCH_PAGE_SIZE = 20
+    }
 }
+
+/**
+ * Requirement 7.1 names only DOWNLOADING, QUEUED and NONE, but the search
+ * indicator renders six visually distinct states. Collapsing to three would
+ * drop the complete/paused/retryable affordances that Requirement 17 requires
+ * be preserved, so the fuller set is modelled here.
+ */
+enum class SearchDownloadStatus { NONE, QUEUED, DOWNLOADING, PAUSED, COMPLETE, RETRYABLE }
+
+data class SearchDownloadState(
+    val status: SearchDownloadStatus,
+    val jobId: Long?,
+)

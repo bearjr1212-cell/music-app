@@ -195,6 +195,9 @@ def search_music(query, callback, offset=0, limit=20):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
+        # Search pages can include channels and playlists; only videos are playable results.
+        if entry.get("ie_key") not in (None, "Youtube"):
+            continue
         video_id = entry.get("id")
         title = entry.get("title")
         if not isinstance(video_id, str) or not video_id or not isinstance(title, str) or not title:

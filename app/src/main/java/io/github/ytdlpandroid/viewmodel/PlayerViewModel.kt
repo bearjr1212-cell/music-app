@@ -1,11 +1,14 @@
 package io.github.ytdlpandroid.viewmodel
 
+import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
-import io.github.ytdlpandroid.PlaybackService
+import io.github.ytdlpandroid.AudioTrack
 import io.github.ytdlpandroid.PlaybackSnapshot
-import io.github.ytdlpandroid.PlaybackTrack
+import io.github.ytdlpandroid.repository.PlaylistRepository
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -13,206 +16,312 @@ import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 /**
- * ViewModel for managing audio playback.
- * Handles playback controls, shuffle, repeat, speed, sleep timer, and equalizer.
+ * ViewModel for the player screen.
+ *
+ * Design — push model:
+ *   MainActivity owns the PlaybackService binding. Whenever the service fires
+ *   onPlaybackChanged, MainActivity calls [updatePlaybackSnapshot] to push the
+ *   new snapshot here. The ViewModel holds all observable state and exposes
+ *   intent methods (play, pause, seekTo, …) that MainActivity forwards to the
+ *   service. This keeps the ViewModel free of any direct service reference and
+ *   survives configuration changes without leaking the binder.
  */
 @HiltViewModel
-class PlayerViewModel @Inject constructor() : ViewModel() {
-    
-    // Playback state
+class PlayerViewModel @Inject constructor(
+    private val playlistRepository: PlaylistRepository,
+) : ViewModel() {
+
+    // -------------------------------------------------------------------------
+    // Playback snapshot (pushed by MainActivity from the service listener)
+    // -------------------------------------------------------------------------
+
     private val _playbackSnapshot = MutableStateFlow<PlaybackSnapshot?>(null)
     val playbackSnapshot: StateFlow<PlaybackSnapshot?> = _playbackSnapshot.asStateFlow()
-    
-    private val _isPlaying = MutableStateFlow(false)
-    val isPlaying: StateFlow<Boolean> = _isPlaying.asStateFlow()
-    
-    private val _currentTrack = MutableStateFlow<PlaybackTrack?>(null)
-    val currentTrack: StateFlow<PlaybackTrack?> = _currentTrack.asStateFlow()
-    
-    private val _position = MutableStateFlow(0)
-    val position: StateFlow<Int> = _position.asStateFlow()
-    
-    private val _duration = MutableStateFlow(0)
-    val duration: StateFlow<Int> = _duration.asStateFlow()
-    
-    private val _shuffle = MutableStateFlow(false)
-    val shuffle: StateFlow<Boolean> = _shuffle.asStateFlow()
-    
-    private val _repeatMode = MutableStateFlow(0) // 0=off, 1=all, 2=one
-    val repeatMode: StateFlow<Int> = _repeatMode.asStateFlow()
-    
-    private val _playbackSpeed = MutableStateFlow(1f)
-    val playbackSpeed: StateFlow<Float> = _playbackSpeed.asStateFlow()
-    
-    private val _sleepMinutesRemaining = MutableStateFlow<Int?>(null)
-    val sleepMinutesRemaining: StateFlow<Int?> = _sleepMinutesRemaining.asStateFlow()
-    
+
+    // -------------------------------------------------------------------------
+    // Derived — now-playing track
+    // -------------------------------------------------------------------------
+
+    private val _nowPlayingTrack = MutableStateFlow<AudioTrack?>(null)
+    val nowPlayingTrack: StateFlow<AudioTrack?> = _nowPlayingTrack.asStateFlow()
+
+    // -------------------------------------------------------------------------
+    // Derived — current queue
+    // Queue items are not carried in PlaybackSnapshot (it only has index +
+    // queueSize). MainActivity must push the full list via [updateQueue] after
+    // playQueue() and after any reorder / removal.
+    // -------------------------------------------------------------------------
+
+    private val _currentQueue = MutableStateFlow<List<AudioTrack>>(emptyList())
+    val currentQueue: StateFlow<List<AudioTrack>> = _currentQueue.asStateFlow()
+
+    // -------------------------------------------------------------------------
+    // Pending playback-control intents
+    // Each field stores the last-requested value so MainActivity can read and
+    // forward it to PlaybackService. See [PlaybackIntent].
+    // -------------------------------------------------------------------------
+
+    private val _pendingIntent = MutableStateFlow<PlaybackIntent?>(null)
+    val pendingIntent: StateFlow<PlaybackIntent?> = _pendingIntent.asStateFlow()
+
+    // -------------------------------------------------------------------------
+    // Sleep timer — coroutine countdown inside the ViewModel (ms precision)
+    // -------------------------------------------------------------------------
+
+    private val _sleepTimerRemaining = MutableStateFlow(0L)
+    val sleepTimerRemaining: StateFlow<Long> = _sleepTimerRemaining.asStateFlow()
+
+    private var sleepTimerJob: Job? = null
+    private var sleepTimerDeadlineMs = 0L
+
+    // -------------------------------------------------------------------------
+    // Equalizer — local state, per-band
+    // -------------------------------------------------------------------------
+
     private val _equalizerEnabled = MutableStateFlow(false)
     val equalizerEnabled: StateFlow<Boolean> = _equalizerEnabled.asStateFlow()
-    
-    private val _equalizerLevel = MutableStateFlow(50)
-    val equalizerLevel: StateFlow<Int> = _equalizerLevel.asStateFlow()
-    
-    private val _message = MutableStateFlow<String?>(null)
-    val message: StateFlow<String?> = _message.asStateFlow()
-    
-    // Service reference
-    private var playbackService: PlaybackService? = null
-    
+
+    // band index → level (Short)
+    private val _bandLevels = MutableStateFlow<Map<Int, Short>>(emptyMap())
+    val bandLevels: StateFlow<Map<Int, Short>> = _bandLevels.asStateFlow()
+
+    // -------------------------------------------------------------------------
+    // Error state
+    // -------------------------------------------------------------------------
+
+    private val _playerError = MutableStateFlow<String?>(null)
+    val playerError: StateFlow<String?> = _playerError.asStateFlow()
+
+    // =========================================================================
+    // Public API — snapshot update (called by MainActivity)
+    // =========================================================================
+
     /**
-     * Sets the playback service reference.
+     * Called by MainActivity whenever PlaybackService fires onPlaybackChanged.
+     * Updates all derived flows from the new snapshot.
      */
-    fun setPlaybackService(service: PlaybackService?) {
-        playbackService = service
-        service?.setListener(playbackListener)
-        // Get initial snapshot
-        _playbackSnapshot.value = service?.getSnapshot()
-        updateStateFromSnapshot()
-    }
-    
-    /**
-     * Listener for playback service updates.
-     */
-    private val playbackListener = object : PlaybackService.Listener {
-        override fun onPlaybackChanged(snapshot: PlaybackSnapshot) {
-            _playbackSnapshot.value = snapshot
-            updateStateFromSnapshot()
+    fun updatePlaybackSnapshot(snapshot: PlaybackSnapshot) {
+        _playbackSnapshot.value = snapshot
+
+        // Derive now-playing track from PlaybackTrack → AudioTrack
+        _nowPlayingTrack.value = snapshot.track?.let { pt ->
+            AudioTrack(
+                uri = Uri.parse(pt.uri),
+                title = pt.title,
+                artist = pt.artist,
+                album = pt.album,
+                durationMs = pt.durationMs,
+                artwork = pt.artwork,
+            )
         }
-        
-        override fun onPlaybackHistoryChanged() {
-            // Handled by PlaylistViewModel
-        }
-        
-        override fun onPlaybackHistoryError() {
-            _message.value = "Failed to save playback history"
+
+        // Surface service-side error messages as player errors
+        snapshot.message?.let { msg ->
+            _playerError.value = msg
         }
     }
-    
+
     /**
-     * Updates state from the playback snapshot.
+     * Called by MainActivity to push the full queue after playQueue() or after
+     * any queue mutation that the service has accepted.
      */
-    private fun updateStateFromSnapshot() {
-        val snapshot = _playbackSnapshot.value ?: return
-        
-        _currentTrack.value = snapshot.track
-        _isPlaying.value = snapshot.isPlaying
-        _position.value = snapshot.positionMs
-        _duration.value = snapshot.durationMs
-        _shuffle.value = snapshot.shuffle
-        _repeatMode.value = snapshot.repeatMode
-        _playbackSpeed.value = snapshot.speed
-        _sleepMinutesRemaining.value = snapshot.sleepMinutesRemaining
-        _equalizerEnabled.value = snapshot.equalizerEnabled
-        _equalizerLevel.value = snapshot.equalizerLevel
-        _message.value = snapshot.message
+    fun updateQueue(tracks: List<AudioTrack>) {
+        _currentQueue.value = tracks.toList()
     }
-    
-    /**
-     * Plays a queue of tracks starting at the specified index.
-     */
-    fun playQueue(tracks: List<PlaybackTrack>, index: Int) {
-        playbackService?.playQueue(tracks, index)
+
+    // =========================================================================
+    // Playback-control intents (MainActivity reads and forwards to service)
+    // =========================================================================
+
+    /** Request playback to resume / start. */
+    fun play() {
+        _pendingIntent.value = PlaybackIntent.Play
     }
-    
-    /**
-     * Toggles playback between play and pause.
-     */
-    fun togglePlayback() {
-        playbackService?.togglePlayback()
+
+    /** Request playback to pause. */
+    fun pause() {
+        _pendingIntent.value = PlaybackIntent.Pause
     }
-    
-    /**
-     * Plays the previous track.
-     */
-    fun playPrevious() {
-        playbackService?.playPrevious()
+
+    /** Request a seek to [positionMs]. */
+    fun seekTo(positionMs: Long) {
+        _pendingIntent.value = PlaybackIntent.SeekTo(positionMs)
     }
-    
-    /**
-     * Plays the next track.
-     */
-    fun playNext() {
-        playbackService?.playNext()
+
+    /** Request skip to the next track. */
+    fun skipNext() {
+        _pendingIntent.value = PlaybackIntent.SkipNext
     }
-    
-    /**
-     * Seeks to the specified position in milliseconds.
-     */
-    fun seekTo(positionMs: Int) {
-        playbackService?.seekTo(positionMs)
+
+    /** Request skip to the previous track. */
+    fun skipPrevious() {
+        _pendingIntent.value = PlaybackIntent.SkipPrevious
     }
-    
-    /**
-     * Sets shuffle mode.
-     */
-    fun setShuffle(enabled: Boolean) {
-        playbackService?.setShuffle(enabled)
+
+    /** Request shuffle state change. */
+    fun setShuffleEnabled(enabled: Boolean) {
+        _pendingIntent.value = PlaybackIntent.SetShuffle(enabled)
     }
-    
-    /**
-     * Sets repeat mode (0=off, 1=all, 2=one).
-     */
+
+    /** Request repeat-mode change (0 = off, 1 = all, 2 = one). */
     fun setRepeatMode(mode: Int) {
-        playbackService?.setRepeatMode(mode)
+        _pendingIntent.value = PlaybackIntent.SetRepeatMode(mode)
     }
-    
-    /**
-     * Sets playback speed.
-     */
+
+    /** Request playback-speed change. */
     fun setPlaybackSpeed(speed: Float) {
-        playbackService?.setPlaybackSpeed(speed)
+        _pendingIntent.value = PlaybackIntent.SetSpeed(speed)
     }
-    
+
     /**
-     * Sets the sleep timer in minutes, or null to cancel.
+     * Acknowledges the last pending intent. MainActivity calls this after it
+     * has forwarded the intent to PlaybackService so it is not replayed.
      */
-    fun setSleepTimerMinutes(minutes: Int?) {
-        playbackService?.setSleepTimerMinutes(minutes)
+    fun clearPendingIntent() {
+        _pendingIntent.value = null
     }
-    
+
+    // =========================================================================
+    // Sleep timer — coroutine-driven countdown (ViewModel-owned)
+    // =========================================================================
+
     /**
-     * Enables or disables the equalizer.
+     * Starts a sleep-timer countdown of [durationMs] milliseconds.
+     * When it reaches zero the ViewModel emits [PlaybackIntent.Pause] so
+     * MainActivity can pause playback.
+     */
+    fun setSleepTimer(durationMs: Long) {
+        cancelSleepTimer()
+        if (durationMs <= 0L) return
+
+        sleepTimerDeadlineMs = System.currentTimeMillis() + durationMs
+        _sleepTimerRemaining.value = durationMs
+
+        sleepTimerJob = viewModelScope.launch {
+            while (true) {
+                val remaining = sleepTimerDeadlineMs - System.currentTimeMillis()
+                if (remaining <= 0L) {
+                    _sleepTimerRemaining.value = 0L
+                    _pendingIntent.value = PlaybackIntent.Pause
+                    break
+                }
+                _sleepTimerRemaining.value = remaining
+                delay(SLEEP_TIMER_TICK_MS)
+            }
+        }
+    }
+
+    /** Cancels any running sleep-timer countdown. */
+    fun cancelSleepTimer() {
+        sleepTimerJob?.cancel()
+        sleepTimerJob = null
+        sleepTimerDeadlineMs = 0L
+        _sleepTimerRemaining.value = 0L
+    }
+
+    // =========================================================================
+    // Equalizer — local state; MainActivity applies changes to AudioEffect
+    // =========================================================================
+
+    /**
+     * Enables or disables the equalizer. Stored locally; MainActivity is
+     * expected to observe [equalizerEnabled] and toggle the AudioEffect.
      */
     fun setEqualizerEnabled(enabled: Boolean) {
-        playbackService?.setEqualizerEnabled(enabled)
+        _equalizerEnabled.value = enabled
     }
-    
+
     /**
-     * Sets the equalizer level (0-100).
+     * Sets the level for a single equalizer band. Stored locally; MainActivity
+     * observes [bandLevels] and applies changes to the AudioEffect.
      */
-    fun setEqualizerLevel(level: Int) {
-        playbackService?.setEqualizerLevel(level)
+    fun setBandLevel(band: Int, level: Short) {
+        _bandLevels.value = _bandLevels.value + (band to level)
     }
-    
+
+    // =========================================================================
+    // Queue mutations — intent-based, forwarded by MainActivity
+    // =========================================================================
+
     /**
-     * Clears the message.
+     * Requests moving the queue item at [from] to position [to].
      */
-    fun clearMessage() {
-        _message.value = null
+    fun moveQueueItem(from: Int, to: Int) {
+        _pendingIntent.value = PlaybackIntent.MoveQueueItem(from, to)
     }
-    
+
     /**
-     * Gets the repeat mode label.
+     * Requests removing the queue item at [index].
      */
-    fun getRepeatModeLabel(mode: Int): String {
-        return when (mode) {
-            0 -> "Off"
-            1 -> "All"
-            2 -> "One"
-            else -> "Off"
+    fun removeFromQueue(index: Int) {
+        _pendingIntent.value = PlaybackIntent.RemoveFromQueue(index)
+    }
+
+    // =========================================================================
+    // Playback history
+    // =========================================================================
+
+    /**
+     * Persists [track] in the playback history via [PlaylistRepository].
+     * Errors are surfaced through [playerError].
+     */
+    fun recordPlaybackHistory(track: AudioTrack) {
+        viewModelScope.launch {
+            try {
+                playlistRepository.recordPlayback(
+                    trackUri = track.uri.toString(),
+                    title = track.title,
+                    artist = track.artist,
+                    album = track.album,
+                    durationMs = track.durationMs,
+                )
+            } catch (e: Exception) {
+                _playerError.value = "Failed to save playback history: ${e.message}"
+            }
         }
     }
-    
-    /**
-     * Gets the sleep timer label.
-     */
-    fun getSleepTimerLabel(minutes: Int?): String {
-        return if (minutes == null) "Off" else "${minutes}m"
+
+    // =========================================================================
+    // Error handling
+    // =========================================================================
+
+    /** Clears the current player error. */
+    fun clearError() {
+        _playerError.value = null
     }
-    
+
+    // =========================================================================
+    // Lifecycle
+    // =========================================================================
+
     override fun onCleared() {
         super.onCleared()
-        playbackService?.setListener(null)
-        playbackService = null
+        cancelSleepTimer()
     }
+
+    // =========================================================================
+    // Companion
+    // =========================================================================
+
+    private companion object {
+        private const val SLEEP_TIMER_TICK_MS = 500L
+    }
+}
+
+/**
+ * Sealed hierarchy of playback-control intents the ViewModel exposes.
+ * MainActivity observes [PlayerViewModel.pendingIntent], executes the
+ * matching PlaybackService call, then calls [PlayerViewModel.clearPendingIntent].
+ */
+sealed interface PlaybackIntent {
+    data object Play : PlaybackIntent
+    data object Pause : PlaybackIntent
+    data class SeekTo(val positionMs: Long) : PlaybackIntent
+    data object SkipNext : PlaybackIntent
+    data object SkipPrevious : PlaybackIntent
+    data class SetShuffle(val enabled: Boolean) : PlaybackIntent
+    data class SetRepeatMode(val mode: Int) : PlaybackIntent
+    data class SetSpeed(val speed: Float) : PlaybackIntent
+    data class MoveQueueItem(val from: Int, val to: Int) : PlaybackIntent
+    data class RemoveFromQueue(val index: Int) : PlaybackIntent
 }

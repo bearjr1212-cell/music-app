@@ -16,7 +16,10 @@ import javax.inject.Inject
 
 /**
  * ViewModel for managing the download queue.
- * Holds observable download state and delegates data operations to DownloadRepository.
+ *
+ * Reads go through [DownloadRepository]; every operation that can start, stop, or reorder
+ * work goes through the bound `DownloadService`, because only the service pumps the worker
+ * pool and refreshes the foreground notification.
  * MainActivity remains the DownloadService binding point and pushes state in via setDownloadService / updateJobs.
  */
 @HiltViewModel
@@ -60,8 +63,8 @@ class DownloadViewModel @Inject constructor(
     private var downloadService: DownloadService? = null
 
     /**
-     * Sets the DownloadService reference so the ViewModel can delegate service-only
-     * operations (pause, wifiOnly, concurrency) without binding directly.
+     * Sets the DownloadService reference so the ViewModel can delegate queue operations
+     * without binding the service itself.
      * Call from MainActivity's ServiceConnection callbacks.
      */
     fun setDownloadService(service: DownloadService?) {
@@ -102,20 +105,25 @@ class DownloadViewModel @Inject constructor(
     // ── Enqueue ───────────────────────────────────────────────────────────────
 
     /**
-     * Validates [urls] then enqueues them via DownloadRepository.
+     * Validates [urls] then hands them to `DownloadService`, which owns the enqueue intent
+     * and the foreground-service start that wakes the worker pool.
+     *
+     * The repository is deliberately not used here: `DownloadRepository.enqueue` writes the
+     * row without starting a worker, so the job would sit queued until some unrelated event
+     * pumped the queue.
      *
      * Validation rules:
      *  - List must not be empty
      *  - At most [AppConfig.MAX_URL_COUNT] URLs (after deduplication by lowercase)
      *  - Every URL must start with "http://" or "https://"
      *
-     * @return [Result.success] with the new job id, or [Result.failure] with a descriptive error.
+     * @return [Result.success], or [Result.failure] with a descriptive error.
      */
-    suspend fun enqueueUrls(
+    fun enqueueUrls(
         urls: List<String>,
         formatMode: String = _selectedFormat.value,
         allowPlaylist: Boolean = false,
-    ): Result<Long> {
+    ): Result<Unit> {
         val deduped = urls.distinctBy { it.lowercase() }
 
         if (deduped.isEmpty()) {
@@ -138,68 +146,79 @@ class DownloadViewModel @Inject constructor(
             )
         }
 
+        val service = downloadService ?: return Result.failure(serviceUnavailable())
+
         return try {
-            val jobId = downloadRepository.enqueue(
+            service.enqueueUrls(
                 urlsJson = JSONArray(deduped).toString(),
                 format = formatMode,
                 allowPlaylist = allowPlaylist,
             )
-            Result.success(jobId)
+            Result.success(Unit)
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
     // ── Job controls ──────────────────────────────────────────────────────────
+    //
+    // Every control below delegates to the bound DownloadService rather than the
+    // repository. The service versions also pump the worker queue and refresh the
+    // foreground notification; the repository versions only write the row, which
+    // would leave a resumed or retried job stranded until the next unrelated event.
 
     /**
-     * Pauses a running job. Delegates to DownloadService (no repository method for pause).
-     * No-ops silently when the service is not yet connected.
+     * Pauses a running job.
      */
     fun pauseJob(jobId: Long) {
-        downloadService?.pauseJob(jobId) ?: run {
-            _downloadError.value = "Download service unavailable"
-        }
+        requireService()?.pauseJob(jobId)
     }
 
     /**
-     * Resumes a paused job via DownloadRepository.
+     * Resumes a paused job.
      */
     fun resumeJob(jobId: Long) {
-        viewModelScope.launch {
-            try {
-                downloadRepository.resumeJob(jobId)
-            } catch (e: Exception) {
-                _downloadError.value = e.message ?: "Failed to resume job"
-            }
-        }
+        requireService()?.resumeJob(jobId)
     }
 
     /**
-     * Cancels a queued or paused job via DownloadRepository.
+     * Cancels a queued, running, or paused job.
      */
     fun cancelJob(jobId: Long) {
-        viewModelScope.launch {
-            try {
-                downloadRepository.cancelJob(jobId)
-            } catch (e: Exception) {
-                _downloadError.value = e.message ?: "Failed to cancel job"
-            }
-        }
+        requireService()?.cancelJob(jobId)
     }
 
     /**
-     * Retries a failed, partial, or canceled job via DownloadRepository.
+     * Retries a failed, partial, or canceled job.
      */
     fun retryJob(jobId: Long) {
-        viewModelScope.launch {
-            try {
-                downloadRepository.retryJob(jobId)
-            } catch (e: Exception) {
-                _downloadError.value = e.message ?: "Failed to retry job"
-            }
-        }
+        requireService()?.retryJob(jobId)
     }
+
+    /**
+     * Moves a queued job to the front of the queue.
+     *
+     * @return `false` when the service is not connected or the store refuses the move
+     *   (only queued jobs are eligible); the caller owns the user-facing message.
+     */
+    fun moveJobToFront(jobId: Long): Boolean =
+        requireService()?.moveJobToFront(jobId) ?: false
+
+    /**
+     * Clears all completed, failed, partial, and canceled jobs.
+     *
+     * @return the number of jobs removed, or `-1` when the service is not connected.
+     */
+    fun clearFinishedJobs(): Int =
+        requireService()?.clearFinishedJobs() ?: -1
+
+    private fun requireService(): DownloadService? =
+        downloadService ?: run {
+            _downloadError.value = SERVICE_UNAVAILABLE
+            null
+        }
+
+    private fun serviceUnavailable() = IllegalStateException(SERVICE_UNAVAILABLE)
 
     // ── Concurrency setting ───────────────────────────────────────────────────
 
@@ -210,9 +229,7 @@ class DownloadViewModel @Inject constructor(
     fun setConcurrentDownloads(n: Int) {
         val clamped = n.coerceIn(1, AppConfig.MAX_CONCURRENT_DOWNLOADS)
         _concurrentDownloads.value = clamped
-        downloadService?.setMaxConcurrentDownloads(clamped) ?: run {
-            _downloadError.value = "Download service unavailable"
-        }
+        requireService()?.setMaxConcurrentDownloads(clamped)
     }
 
     // ── Wi-Fi only ────────────────────────────────────────────────────────────
@@ -223,9 +240,7 @@ class DownloadViewModel @Inject constructor(
      */
     fun setWifiOnly(enabled: Boolean) {
         _wifiOnly.value = enabled
-        downloadService?.setWifiOnly(enabled) ?: run {
-            _downloadError.value = "Download service unavailable"
-        }
+        requireService()?.setWifiOnly(enabled)
     }
 
     // ── Format selection ──────────────────────────────────────────────────────
@@ -242,22 +257,6 @@ class DownloadViewModel @Inject constructor(
         _selectedFormat.value = format
     }
 
-    // ── History ───────────────────────────────────────────────────────────────
-
-    /**
-     * Clears all completed, failed, partial, and canceled jobs via DownloadRepository.
-     */
-    fun clearCompletedJobs() {
-        viewModelScope.launch {
-            try {
-                downloadRepository.clearFinished()
-                refreshJobs()
-            } catch (e: Exception) {
-                _downloadError.value = e.message ?: "Failed to clear jobs"
-            }
-        }
-    }
-
     // ── Utility ───────────────────────────────────────────────────────────────
 
     /**
@@ -270,5 +269,9 @@ class DownloadViewModel @Inject constructor(
     override fun onCleared() {
         super.onCleared()
         downloadService = null
+    }
+
+    private companion object {
+        const val SERVICE_UNAVAILABLE = "Download service unavailable"
     }
 }

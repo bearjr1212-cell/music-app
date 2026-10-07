@@ -36,6 +36,10 @@ class PlaylistStore(context: Context) : SQLiteOpenHelper(
     null,
     DATABASE_VERSION,
 ) {
+    private val appContext: Context = context.applicationContext
+
+    private fun canonical(trackUri: String): String = MediaUris.canonicalAudio(appContext, trackUri)
+
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
             """CREATE TABLE playlists (
@@ -98,8 +102,72 @@ class PlaylistStore(context: Context) : SQLiteOpenHelper(
             db.execSQL("CREATE INDEX playlist_tracks_order ON playlist_tracks(playlist_id, position, added_at, track_uri)")
         }
         if (oldVersion < 3) createPlaybackHistorySchema(db)
-        if (oldVersion < 1 || newVersion > 3) {
+        if (oldVersion < 12) mergeMediaStoreAliases(db)
+        if (oldVersion < 1 || newVersion > 12) {
             error("No playlist database migration exists from version $oldVersion")
+        }
+    }
+
+    /**
+     * Rewrites Downloads-collection aliases (`.../downloads/<id>`) to their Audio-collection URI
+     * so the same file is no longer stored, listed, or added to playlists twice.
+     */
+    private fun mergeMediaStoreAliases(db: SQLiteDatabase) {
+        // track_metadata: move alias rows onto the canonical key, keeping an existing canonical row.
+        val metadataUris = db.query("track_metadata", arrayOf("uri"), null, null, null, null, null).use { c ->
+            buildList { while (c.moveToNext()) add(c.getString(0)) }
+        }
+        val metadataSet = metadataUris.toMutableSet()
+        metadataUris.forEach { raw ->
+            val target = canonical(raw)
+            if (target == raw) return@forEach
+            if (target in metadataSet) {
+                db.delete("track_metadata", "uri = ?", arrayOf(raw))
+            } else {
+                db.update("track_metadata", ContentValues().apply { put("uri", target) }, "uri = ?", arrayOf(raw))
+                metadataSet.add(target)
+            }
+            metadataSet.remove(raw)
+        }
+
+        // playlist_tracks: rewrite per playlist, dropping entries that collapse onto an earlier one.
+        val playlistIds = db.query("playlists", arrayOf("id"), null, null, null, null, null).use { c ->
+            buildList { while (c.moveToNext()) add(c.getLong(0)) }
+        }
+        playlistIds.forEach { playlistId ->
+            val tracks = playlistTracks(db, playlistId)
+            val seen = mutableSetOf<String>()
+            var changed = false
+            tracks.forEach { raw ->
+                val target = canonical(raw)
+                if (target in seen) {
+                    db.delete("playlist_tracks", "playlist_id = ? AND track_uri = ?", arrayOf(playlistId.toString(), raw))
+                    changed = true
+                } else {
+                    seen.add(target)
+                    if (target != raw) {
+                        db.update(
+                            "playlist_tracks",
+                            ContentValues().apply { put("track_uri", target) },
+                            "playlist_id = ? AND track_uri = ?",
+                            arrayOf(playlistId.toString(), raw),
+                        )
+                        changed = true
+                    }
+                }
+            }
+            if (changed) rewritePositions(db, playlistId, playlistTracks(db, playlistId))
+        }
+
+        // playback_history has no uniqueness constraint; just normalise.
+        val historyUris = db.rawQuery("SELECT DISTINCT track_uri FROM playback_history", null).use { c ->
+            buildList { while (c.moveToNext()) add(c.getString(0)) }
+        }
+        historyUris.forEach { raw ->
+            val target = canonical(raw)
+            if (target != raw) {
+                db.update("playback_history", ContentValues().apply { put("track_uri", target) }, "track_uri = ?", arrayOf(raw))
+            }
         }
     }
 
@@ -156,6 +224,27 @@ class PlaylistStore(context: Context) : SQLiteOpenHelper(
     }
 
     @Synchronized
+    fun findPlaylistByName(name: String): SavedPlaylist? {
+        // Targeted lookup for the "is this track liked?" menu check: it only needs ONE playlist,
+        // so avoid getPlaylists()' full JOIN over every playlist and all of its tracks. Read-only,
+        // so no schema/version change is involved.
+        val db = readableDatabase
+        val header = db.query(
+            "playlists",
+            arrayOf("id", "name"),
+            "name = ? COLLATE NOCASE",
+            arrayOf(name),
+            null,
+            null,
+            "id ASC",
+            "1",
+        ).use { cursor ->
+            if (cursor.moveToFirst()) cursor.getLong(0) to cursor.getString(1) else null
+        } ?: return null
+        return SavedPlaylist(header.first, header.second, playlistTracks(db, header.first))
+    }
+
+    @Synchronized
     fun createPlaylist(name: String): Long {
         val normalizedName = name.trim()
         require(normalizedName.isNotEmpty()) { "Playlist name cannot be empty" }
@@ -167,8 +256,9 @@ class PlaylistStore(context: Context) : SQLiteOpenHelper(
     }
 
     @Synchronized
-    fun addTrack(playlistId: Long, trackUri: String): Boolean {
-        if (trackUri.isBlank()) return false
+    fun addTrack(playlistId: Long, rawTrackUri: String): Boolean {
+        if (rawTrackUri.isBlank()) return false
+        val trackUri = canonical(rawTrackUri)
         val db = writableDatabase
         db.beginTransaction()
         try {
@@ -204,6 +294,56 @@ class PlaylistStore(context: Context) : SQLiteOpenHelper(
         }
     }
 
+    /**
+     * Inserts many tracks into one playlist inside a SINGLE transaction, returning how many were
+     * newly added. Per-URI this is byte-for-byte the logic of [addTrack]: blank URIs are skipped,
+     * duplicates are ignored via the (playlist_id, track_uri) primary key + CONFLICT_IGNORE, and
+     * each new row gets the next sequential position. Callers that used to loop over [addTrack]
+     * paid one transaction per track; this collapses that to one.
+     */
+    @Synchronized
+    fun addTracks(playlistId: Long, trackUris: List<String>): Int {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val playlistExists = db.query(
+                "playlists",
+                arrayOf("id"),
+                "id = ?",
+                arrayOf(playlistId.toString()),
+                null,
+                null,
+                null,
+            ).use { it.moveToFirst() }
+            if (!playlistExists) return 0
+            var inserted = 0
+            trackUris.forEach { rawTrackUri ->
+                if (rawTrackUri.isBlank()) return@forEach
+                val trackUri = canonical(rawTrackUri)
+                val nextPosition = db.rawQuery(
+                    "SELECT COALESCE(MAX(position), -1) + 1 FROM playlist_tracks WHERE playlist_id = ?",
+                    arrayOf(playlistId.toString()),
+                ).use { cursor -> cursor.moveToFirst(); cursor.getLong(0) }
+                val added = db.insertWithOnConflict(
+                    "playlist_tracks",
+                    null,
+                    ContentValues().apply {
+                        put("playlist_id", playlistId)
+                        put("track_uri", trackUri)
+                        put("added_at", System.currentTimeMillis())
+                        put("position", nextPosition)
+                    },
+                    SQLiteDatabase.CONFLICT_IGNORE,
+                ) != -1L
+                if (added) inserted++
+            }
+            db.setTransactionSuccessful()
+            return inserted
+        } finally {
+            db.endTransaction()
+        }
+    }
+
     @Synchronized
     fun removeTrack(playlistId: Long, trackUri: String): Boolean {
         val db = writableDatabase
@@ -211,8 +351,8 @@ class PlaylistStore(context: Context) : SQLiteOpenHelper(
         try {
             val removed = db.delete(
                 "playlist_tracks",
-                "playlist_id = ? AND track_uri = ?",
-                arrayOf(playlistId.toString(), trackUri),
+                "playlist_id = ? AND track_uri IN (?, ?)",
+                arrayOf(playlistId.toString(), trackUri, canonical(trackUri)),
             ) > 0
             if (!removed) return false
             rewritePositions(db, playlistId, playlistTracks(db, playlistId))
@@ -262,7 +402,7 @@ class PlaylistStore(context: Context) : SQLiteOpenHelper(
             "track_metadata",
             arrayOf("uri", "title", "artist", "album", "duration_ms", "artwork_path"),
             "uri = ?",
-            arrayOf(trackUri),
+            arrayOf(canonical(trackUri)),
             null,
             null,
             null,
@@ -298,7 +438,7 @@ class PlaylistStore(context: Context) : SQLiteOpenHelper(
     ) {
         require(trackUri.isNotBlank()) { "Track URI cannot be empty" }
         val values = ContentValues().apply {
-            put("uri", trackUri)
+            put("uri", canonical(trackUri))
             put("title", title)
             put("artist", artist)
             put("album", album)
@@ -327,7 +467,7 @@ class PlaylistStore(context: Context) : SQLiteOpenHelper(
             "playback_history",
             null,
             ContentValues().apply {
-                put("track_uri", trackUri)
+                put("track_uri", canonical(trackUri))
                 put("title", title)
                 put("artist", artist)
                 put("album", album)
@@ -421,6 +561,6 @@ class PlaylistStore(context: Context) : SQLiteOpenHelper(
 
     companion object {
         private const val DATABASE_NAME = "playlists.db"
-        private const val DATABASE_VERSION = 3
+        private const val DATABASE_VERSION = 12
     }
 }

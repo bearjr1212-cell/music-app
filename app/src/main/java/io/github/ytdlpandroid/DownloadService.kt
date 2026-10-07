@@ -194,6 +194,16 @@ class DownloadService : Service() {
         }
     }
 
+    fun enqueueUrls(urlsJson: String, format: String, allowPlaylist: Boolean) {
+        startServiceIntent(
+            Intent(this, DownloadService::class.java)
+                .setAction(ACTION_ENQUEUE)
+                .putExtra(EXTRA_URLS, urlsJson)
+                .putExtra(EXTRA_FORMAT, format)
+                .putExtra(EXTRA_PLAYLIST, allowPlaylist),
+        )
+    }
+
     fun clearFinishedJobs(): Int {
         val removed = queueStore.clearFinished()
         if (removed > 0) notifyQueue()
@@ -986,22 +996,6 @@ class DownloadService : Service() {
         }
     }
 
-    private fun trustedThumbnailUrl(value: String?): String? {
-        if (value.isNullOrBlank()) return null
-        return try {
-            val uri = Uri.parse(value)
-            value.takeIf {
-                uri.scheme.equals("https", ignoreCase = true) &&
-                    uri.host.equals(YOUTUBE_THUMBNAIL_HOST, ignoreCase = true) &&
-                    uri.userInfo == null &&
-                    (uri.port == -1 || uri.port == 443) &&
-                    uri.fragment == null
-            }
-        } catch (_: Exception) {
-            null
-        }
-    }
-
     private fun fetchArtwork(thumbnailUrl: String, control: JobControl): File {
         val trustedUrl = trustedThumbnailUrl(thumbnailUrl)
             ?: throw IllegalArgumentException("Thumbnail URL is not a trusted HTTPS YouTube image")
@@ -1289,7 +1283,6 @@ class DownloadService : Service() {
         const val EXTRA_PLAYLIST = "io.github.ytdlpandroid.extra.PLAYLIST"
         private const val CHANNEL_ID = "yt_dlp_downloads"
         private const val NOTIFICATION_ID = 1
-        private const val YOUTUBE_THUMBNAIL_HOST = "i.ytimg.com"
         private const val PREFERENCES_NAME = "download-settings"
         private const val PREFERENCE_MAX_CONCURRENT_DOWNLOADS = "max_concurrent_downloads"
         private const val PREFERENCE_WIFI_ONLY = "wifi_only"
